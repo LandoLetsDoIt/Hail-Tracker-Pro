@@ -25,7 +25,10 @@ jobs:
           sudo apt-get install -y libeccodes-dev
           python -m pip install --upgrade pip
           pip install -r worker/requirements.txt
-      - name: Run hail worker
+      - name: Run worker unit tests
+        run: |
+          python -m pytest worker/test_hail_engine.py
+      - name: Run hail worker dry run
         run: |
           cd worker
-          python hail_engine.py latest
+          python hail_engine.py latest --dry-run
