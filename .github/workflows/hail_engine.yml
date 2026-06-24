@@ -35,7 +35,7 @@ jobs:
 
   supabase-verify:
     needs: hail-phase-0
-    if: github.event_name == 'workflow_dispatch' && secrets.SUPABASE_URL && secrets.SUPABASE_SERVICE_ROLE_KEY
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -48,6 +48,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r worker/requirements.txt
       - name: Verify Supabase read-only access
+        if: ${{ secrets.SUPABASE_URL && secrets.SUPABASE_SERVICE_ROLE_KEY }}
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
