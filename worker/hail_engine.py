@@ -6,13 +6,17 @@ import re
 import shutil
 import tempfile
 import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
 import numpy as np
 import pygrib
 import requests
+from dotenv import load_dotenv
+
+# Load environment variables from .env at project root
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 MRMS_MESH_SOURCES = [
     {
@@ -39,6 +43,10 @@ SUPABASE_URL = os.getenv("SUPABASE_URL") or os.getenv("NEXT_PUBLIC_SUPABASE_URL"
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 SUPABASE_TABLE_REGIONS = "regions"
 SUPABASE_TABLE_ALERTS = "hail_alerts"
+RESEND_API_KEY = os.getenv("RESEND_API_KEY")
+ALERT_EMAIL_TO = os.getenv("ALERT_EMAIL_TO")
+RESEND_FROM_EMAIL = "onboarding@resend.dev"
+ALERT_RESEND_WINDOW_HOURS = 6
 
 DEFAULT_WATCHED_REGIONS = [
     {
@@ -56,6 +64,10 @@ DEFAULT_WATCHED_REGIONS = [
 
 def is_supabase_configured() -> bool:
     return bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
+
+
+def is_email_configured() -> bool:
+    return bool(RESEND_API_KEY and ALERT_EMAIL_TO)
 
 
 def get_supabase_headers() -> dict[str, str]:
@@ -397,6 +409,7 @@ def _normalize_region_record(region: dict) -> dict:
         "max_lat": float(region.get("max_lat") or region.get("lat_max") or 0.0),
         "max_lon": float(region.get("max_lon") or region.get("lon_max") or 0.0),
         "threshold_mm": float(region.get("threshold_mm") or 0.0),
+        "email_enabled": bool(region.get("email_enabled", True)),
     }
 
 
@@ -453,6 +466,118 @@ def find_alert_by_region_and_mesh(region_id: int, mesh_url: str) -> dict | None:
         return None
 
 
+def has_recent_alert_for_region(region_id: int, within_hours: int, exclude_alert_id: int | None = None) -> bool:
+    if not is_supabase_configured() or region_id is None:
+        return False
+
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=within_hours)
+
+    def _parse_timestamp(value: str | None) -> datetime | None:
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                return parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+        except Exception:
+            return None
+
+    try:
+        params = {
+            "select": "id,triggered_at,email_sent_at",
+            "region_id": f"eq.{region_id}",
+            "order": "triggered_at.desc",
+            "limit": "25",
+        }
+        response = supabase_request("GET", SUPABASE_TABLE_ALERTS, params=params)
+        alerts = response.json()
+
+        for alert in alerts:
+            if exclude_alert_id is not None and alert.get("id") == exclude_alert_id:
+                continue
+            reference_time = _parse_timestamp(alert.get("email_sent_at")) or _parse_timestamp(
+                alert.get("triggered_at")
+            )
+            if reference_time and reference_time >= cutoff:
+                return True
+        return False
+    except Exception as exc:
+        # Backward compatibility: if email_sent_at does not exist yet, fall back to triggered_at-only query.
+        logger.warning("Primary recent-alert query failed for region %s, using fallback: %s", region_id, exc)
+        try:
+            cutoff_iso = cutoff.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            fallback_params = {
+                "select": "id,triggered_at",
+                "region_id": f"eq.{region_id}",
+                "triggered_at": f"gte.{cutoff_iso}",
+                "order": "triggered_at.desc",
+                "limit": "1",
+            }
+            if exclude_alert_id is not None:
+                fallback_params["id"] = f"neq.{exclude_alert_id}"
+            fallback_response = supabase_request("GET", SUPABASE_TABLE_ALERTS, params=fallback_params)
+            return bool(fallback_response.json())
+        except Exception as fallback_exc:
+            logger.warning("Fallback recent-alert query failed for region %s: %s", region_id, fallback_exc)
+            return False
+
+
+def send_alert_email(region_name: str, hail_in: float, triggered_at: str) -> bool:
+    if not is_email_configured():
+        logger.info("Email alert not configured; skipping send")
+        return False
+
+    endpoint = "https://api.resend.com/emails"
+    subject = f"Hail Alert: {region_name} reached {hail_in:.2f}\""
+    text = (
+        "New hail alert triggered.\n"
+        f"Region: {region_name}\n"
+        f"Hail size: {hail_in:.2f} in\n"
+        f"Time: {triggered_at}\n"
+    )
+    html = (
+        "<h2>New hail alert triggered</h2>"
+        f"<p><strong>Region:</strong> {region_name}</p>"
+        f"<p><strong>Hail size:</strong> {hail_in:.2f} in</p>"
+        f"<p><strong>Time:</strong> {triggered_at}</p>"
+    )
+
+    headers = {
+        "Authorization": f"Bearer {RESEND_API_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    payload = {
+        "from": RESEND_FROM_EMAIL,
+        "to": [ALERT_EMAIL_TO],
+        "subject": subject,
+        "text": text,
+        "html": html,
+    }
+
+    try:
+        response = requests.post(endpoint, headers=headers, json=payload, timeout=30)
+        if response.status_code >= 400:
+            logger.warning("Resend email failed: %s %s", response.status_code, response.text)
+            return False
+        message_id = None
+        try:
+            response_payload = response.json()
+            message_id = response_payload.get("id")
+        except Exception:
+            message_id = None
+
+        if message_id:
+            logger.info("Resend email sent to %s (message_id=%s)", ALERT_EMAIL_TO, message_id)
+        else:
+            logger.info("Resend email sent to %s (message_id unavailable)", ALERT_EMAIL_TO)
+        return True
+    except Exception as exc:
+        logger.warning("Resend email request failed: %s", exc)
+        return False
+
+
 def create_hail_alert(region: dict, mesh_url: str, mesh_source: str, hail_mm: float, hail_in: float) -> dict:
     if region.get("id") is None:
         raise RuntimeError("Cannot create Supabase alert for a region without an id")
@@ -478,9 +603,44 @@ def create_hail_alert(region: dict, mesh_url: str, mesh_source: str, hail_mm: fl
         headers=headers,
     )
     created = response.json()
-    if created:
-        logger.info("Created alert id=%s for region %s, mesh=%s", created[0].get("id"), region.get("id"), mesh_url)
-    return created[0] if created else {}
+    if not created:
+        return {}
+
+    alert = created[0]
+    logger.info("Created alert id=%s for region %s, mesh=%s", alert.get("id"), region.get("id"), mesh_url)
+
+    recent_exists = has_recent_alert_for_region(
+        region_id=region["id"],
+        within_hours=ALERT_RESEND_WINDOW_HOURS,
+        exclude_alert_id=alert.get("id"),
+    )
+    if recent_exists:
+        logger.info(
+            "Skipping email for alert id=%s in region %s; another alert fired within the last %s hours",
+            alert.get("id"),
+            region.get("id"),
+            ALERT_RESEND_WINDOW_HOURS,
+        )
+        return alert
+
+    if not bool(region.get("email_enabled", True)):
+        logger.info(
+            "Skipping email for alert id=%s in region %s; email_enabled=false",
+            alert.get("id"),
+            region.get("id"),
+        )
+        return alert
+
+    triggered_at = alert.get("triggered_at") or (datetime.utcnow().replace(microsecond=0).isoformat() + "Z")
+    sent = send_alert_email(region.get("name") or region.get("slug") or "Unknown Region", hail_in, triggered_at)
+    if sent:
+        try:
+            email_sent_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            update_hail_alert(int(alert["id"]), {"email_sent_at": email_sent_at})
+            alert["email_sent_at"] = email_sent_at
+        except Exception as exc:
+            logger.warning("Failed to update email_sent_at for alert id=%s: %s", alert.get("id"), exc)
+    return alert
 
 
 def update_hail_alert(alert_id: int, data: dict) -> None:
@@ -595,8 +755,34 @@ def main() -> int:
         action="store_true",
         help="Do not write Supabase alerts; only print what would happen",
     )
+    parser.add_argument(
+        "--email-smoke-test",
+        action="store_true",
+        help="Send a single test email via Resend and exit (no NOAA/Supabase usage)",
+    )
+    parser.add_argument(
+        "--email-region",
+        default="Manual Smoke Test",
+        help="Region label used by --email-smoke-test",
+    )
+    parser.add_argument(
+        "--email-hail-in",
+        type=float,
+        default=1.0,
+        help="Hail inches used by --email-smoke-test",
+    )
 
     args = parser.parse_args()
+
+    if args.email_smoke_test:
+        triggered_at = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+        sent = send_alert_email(args.email_region, args.email_hail_in, triggered_at)
+        if sent:
+            print("Email smoke test sent successfully")
+            return 0
+        print("Email smoke test failed; verify RESEND_API_KEY and ALERT_EMAIL_TO")
+        return 1
+
     source = args.source
     resolved_source = None
     if source.lower() == "latest":

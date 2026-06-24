@@ -34,6 +34,48 @@ python worker/hail_engine.py latest --scan-regions --dry-run
 
 Use `--dry-run` to verify region scanning without creating alerts.
 
+### Phase 1 manual runbook (local)
+
+Use these commands from the repository root on Windows.
+
+Before using the integration script below, apply the migration in `supabase/migrations/03_hail_alerts_email_sent_at.sql` to your Supabase database so `hail_alerts.email_sent_at` exists.
+
+1. Quick email smoke test (no NOAA fetch, no Supabase writes):
+
+```powershell
+C:/Users/Lando/miniconda3/envs/hail-env/python.exe worker/hail_engine.py --email-smoke-test --email-region "Manual Test" --email-hail-in 1.25
+```
+
+2. Force one end-to-end trigger by lowering threshold to `0.0` mm:
+
+```powershell
+C:/Users/Lando/miniconda3/envs/hail-env/python.exe -c "import os, requests; from worker.verify_supabase import get_supabase_headers; b=os.getenv('SUPABASE_URL').rstrip('/'); h={**get_supabase_headers(),'Prefer':'return=representation'}; u=f'{b}/rest/v1/regions?id=eq.1'; r=requests.patch(u,headers=h,json={'threshold_mm':0.0},timeout=30); print('PATCH_STATUS', r.status_code); print('PATCH_BODY', r.text)"
+```
+
+3. Run a real region scan (writes alert, sends email if eligible):
+
+```powershell
+C:/Users/Lando/miniconda3/envs/hail-env/python.exe worker/hail_engine.py latest --scan-regions
+```
+
+4. Restore threshold to normal (`25.4` mm = `1.0` inch):
+
+```powershell
+C:/Users/Lando/miniconda3/envs/hail-env/python.exe -c "import os, requests; from worker.verify_supabase import get_supabase_headers; b=os.getenv('SUPABASE_URL').rstrip('/'); h={**get_supabase_headers(),'Prefer':'return=representation'}; u=f'{b}/rest/v1/regions?id=eq.1'; r=requests.patch(u,headers=h,json={'threshold_mm':25.4},timeout=30); print('RESTORE_STATUS', r.status_code); print('RESTORE_BODY', r.text)"
+```
+
+5. Optional cleanup: clear active test alert row for region `1`:
+
+```powershell
+C:/Users/Lando/miniconda3/envs/hail-env/python.exe -c "import os, requests; from worker.verify_supabase import get_supabase_headers; b=os.getenv('SUPABASE_URL').rstrip('/'); h=get_supabase_headers(); q=f'{b}/rest/v1/hail_alerts?select=id,is_active,triggered_at,region_id&region_id=eq.1&is_active=eq.true&order=triggered_at.desc&limit=1'; r=requests.get(q,headers=h,timeout=30); print('ACTIVE_QUERY_STATUS', r.status_code); print('ACTIVE_QUERY_BODY', r.text); rows=r.json();\nif rows:\n rid=rows[0]['id']; hd={**h,'Prefer':'return=representation'}; d=requests.patch(f'{b}/rest/v1/hail_alerts?id=eq.{rid}',headers=hd,json={'is_active':False},timeout=30); print('CLEAR_STATUS', d.status_code); print('CLEAR_BODY', d.text)\nelse:\n print('CLEAR_STATUS skipped'); print('CLEAR_BODY []')"
+```
+
+6. One-command integration flow (insert -> email logic -> verify -> cleanup):
+
+```powershell
+C:/Users/Lando/miniconda3/envs/hail-env/python.exe worker/integration_email_alert_flow.py
+```
+
 ### GitHub Actions Supabase verification
 
 A manual workflow dispatch now verifies Supabase only when secrets are configured.
