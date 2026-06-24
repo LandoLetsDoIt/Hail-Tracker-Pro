@@ -32,3 +32,25 @@ jobs:
         run: |
           cd worker
           python hail_engine.py latest --dry-run
+
+  supabase-verify:
+    needs: hail-phase-0
+    if: github.event_name == 'workflow_dispatch' && secrets.SUPABASE_URL && secrets.SUPABASE_SERVICE_ROLE_KEY
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r worker/requirements.txt
+      - name: Verify Supabase read-only access
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          cd worker
+          python verify_supabase.py --dry-run
