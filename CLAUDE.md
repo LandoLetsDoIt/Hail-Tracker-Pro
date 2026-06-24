@@ -127,5 +127,17 @@ one printed hail number) BEFORE building any UI, DB, or notification code. See P
 ## Current Phase
 
 **PHASE 1** — ingestion worker is now validated for fallback MESH sources and the Phase 0 script can resolve an MRMS file and produce a hail estimate for Springfield, MO.
-The next work should proceed toward the Phase 1 PRD by hardening source discovery, making the worker idempotent, and preparing for notification/storage integration.
+
+Progress in Phase 1:
+
+- Worker can discover MRMS MESH files (NOAA listing, MRMS host probing, S3 fallback).
+- Worker reads GRIB2, extracts nearest-point and bbox maximum hail measurements, and normalizes negative values to 0.0 mm.
+- Worker supports Supabase integration: reads `regions` and can create/clear records in `hail_alerts` when `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are provided.
+
+Next steps:
+
+- Validate end-to-end Supabase writes in a safe environment using the service role key (dry-run first).
+- Harden idempotency for repeated runs on the same MESH file and implement notification hooks (Resend / OneSignal).
+
+The worker is ready for Phase 1 verification and controlled rollout.
 

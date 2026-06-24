@@ -1,7 +1,23 @@
 import pathlib
 import pytest
 
-from worker.hail_engine import read_mesh_value
+from worker.hail_engine import is_supabase_configured, load_active_regions, mm_to_inches, read_mesh_value
+
+
+def test_mm_to_inches():
+    assert mm_to_inches(25.4) == pytest.approx(1.0)
+    assert mm_to_inches(0.0) == 0.0
+
+
+def test_load_active_regions_falls_back_without_supabase(monkeypatch):
+    monkeypatch.delenv('SUPABASE_URL', raising=False)
+    monkeypatch.delenv('NEXT_PUBLIC_SUPABASE_URL', raising=False)
+    monkeypatch.delenv('SUPABASE_SERVICE_ROLE_KEY', raising=False)
+
+    regions = load_active_regions()
+    assert isinstance(regions, list)
+    assert len(regions) == 1
+    assert regions[0]['slug'] == 'springfield-mo'
 
 
 def test_read_mesh_value_nearest_point():
