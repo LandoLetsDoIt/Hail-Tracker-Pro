@@ -49,3 +49,4 @@ __pycache__/
 # local data files
 *.grib2
 *.grib2.gz
+miniconda.exe
