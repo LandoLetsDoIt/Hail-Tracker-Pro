@@ -34,6 +34,28 @@ python worker/hail_engine.py latest --scan-regions --dry-run
 
 Use `--dry-run` to verify region scanning without creating alerts.
 
+### GitHub Actions Supabase verification
+
+A manual workflow dispatch now verifies Supabase only when secrets are configured.
+
+1. Add these repository secrets in GitHub:
+
+```text
+SUPABASE_URL
+SUPABASE_SERVICE_ROLE_KEY
+```
+
+2. Open the Actions tab and run the `Hail Lead Engine` workflow manually.
+
+3. If secrets are present, the `supabase-verify` job will execute:
+
+```bash
+cd worker
+python verify_supabase.py --dry-run
+```
+
+This validates read-only Supabase access without writing alerts.
+
 ### Notes
 
 - The worker reads `regions` and writes `hail_alerts` when Supabase is configured.
