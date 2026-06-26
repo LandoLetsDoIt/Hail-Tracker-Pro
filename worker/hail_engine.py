@@ -20,16 +20,17 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 MRMS_MESH_SOURCES = [
     {
-        "name": "thredds",
-        "base_url": "https://thredds.ncep.noaa.gov/thredds/fileServer/meso_analyses/merged/mesh/",
-        "supports_listing": True,
-    },
-    {
         "name": "mrms-host",
         "base_url": "https://mrms.ncep.noaa.gov/data/2D/merged/mesh/",
         "supports_listing": False,
     },
+    {
+        "name": "thredds",
+        "base_url": "https://thredds.ncep.noaa.gov/thredds/fileServer/meso_analyses/merged/mesh/",
+        "supports_listing": True,
+    },
 ]
+MRMS_NOAA_LATEST_URL = "https://mrms.ncep.noaa.gov/data/2D/MESH_Max_60min/MRMS_MESH_Max_60min.latest.grib2.gz"
 MRMS_S3_BUCKET = "https://noaa-mrms-pds.s3.amazonaws.com/"
 MRMS_S3_MESH_PREFIX = "CONUS/MESH_Max_60min_00.50/"
 SPRINGFIELD_LAT = 37.21
@@ -181,20 +182,47 @@ def resolve_latest_s3_mesh_url() -> str:
     return resolved
 
 
+def resolve_noaa_latest_mesh_url() -> str:
+    logger.info("Resolving latest MESH file from NOAA latest URL")
+    response = requests.get(
+        MRMS_NOAA_LATEST_URL,
+        timeout=30,
+        stream=True,
+        allow_redirects=True,
+        headers={"User-Agent": "Mozilla/5.0"},
+    )
+    try:
+        response.raise_for_status()
+        logger.info("Resolved NOAA latest file: %s", MRMS_NOAA_LATEST_URL)
+        return MRMS_NOAA_LATEST_URL
+    finally:
+        response.close()
+
+
 def resolve_latest_mesh_url_from_sources() -> str:
     last_err = None
+
+    # Primary source: NOAA stable "latest" endpoint for MESH Max 60min.
+    try:
+        return resolve_noaa_latest_mesh_url()
+    except Exception as exc:
+        logger.warning("Failed NOAA latest URL fallback: %s", exc)
+        last_err = exc
+
+    # Secondary fallback: AWS MRMS public S3 listing.
+    try:
+        return resolve_latest_s3_mesh_url()
+    except Exception as exc:
+        logger.warning("Failed AWS S3 MRMS fallback: %s", exc)
+        last_err = exc
+
+    # Legacy sources retained for resiliency; Thredds is intentionally last priority.
     for source in MRMS_MESH_SOURCES:
         try:
             return resolve_latest_mesh_url(source["base_url"], source["supports_listing"])
         except Exception as exc:
             logger.warning("Failed source %s (%s): %s", source["name"], source["base_url"], exc)
             last_err = exc
-
-    try:
-        return resolve_latest_s3_mesh_url()
-    except Exception as exc:
-        logger.warning("Failed AWS S3 MRMS fallback: %s", exc)
-        last_err = exc
 
     raise RuntimeError(
         "Could not resolve latest MESH file from any configured MRMS source"
