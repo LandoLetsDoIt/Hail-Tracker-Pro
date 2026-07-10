@@ -1,4 +1,5 @@
 import argparse
+import base64
 import gzip
 import logging
 import os
@@ -14,6 +15,7 @@ import numpy as np
 import pygrib
 import requests
 from dotenv import load_dotenv
+from kml_builder import build_hail_swath_kml
 
 # Load environment variables from .env at project root
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
@@ -36,6 +38,7 @@ MRMS_S3_MESH_PREFIX = "CONUS/MESH_Max_60min_00.50/"
 SPRINGFIELD_LAT = 37.21
 SPRINGFIELD_LON = -93.29
 MM_PER_INCH = 25.4
+KML_DAMAGE_MIN_MM = 19.0
 
 logger = logging.getLogger("hail_engine")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -316,6 +319,9 @@ def _extract_nearest_value(mesh_message, lat: float, lon: float) -> float:
 
     if hail_mm is None or np.isnan(hail_mm):
         lats, lons = mesh_message.latlons()
+        lats = np.asarray(lats, dtype=float)
+        lons = np.asarray(lons, dtype=float)
+        lons = np.where(lons > 180.0, lons - 360.0, lons)
         distances = np.hypot(lats - lat, lons - lon)
         nearest_idx = np.unravel_index(np.nanargmin(distances), distances.shape)
         hail_mm = float(mesh_message.values[nearest_idx])
@@ -374,6 +380,7 @@ def read_mesh_max_in_bbox(filename: Path, min_lat: float, min_lon: float, max_la
             lats, lons = mesh_message.latlons()
             lats = np.asarray(lats, dtype=float)
             lons = np.asarray(lons, dtype=float)
+            lons = np.where(lons > 180.0, lons - 360.0, lons)
 
             bbox_mask = (
                 (lats >= min_lat)
@@ -404,6 +411,58 @@ def read_mesh_max_in_bbox(filename: Path, min_lat: float, min_lon: float, max_la
                 hail_mm = 0.0
 
             return float(hail_mm)
+    finally:
+        if use_path != filename and use_path.exists():
+            try:
+                use_path.unlink()
+            except Exception:
+                logger.debug("Failed to remove temp file %s", use_path)
+
+
+def read_mesh_cells_in_bbox_at_or_above(
+    filename: Path,
+    min_lat: float,
+    min_lon: float,
+    max_lat: float,
+    max_lon: float,
+    min_hail_mm: float,
+) -> list[tuple[float, float, float]]:
+    use_path = _decompress_if_needed(filename)
+    try:
+        with pygrib.open(str(use_path)) as grbs:
+            mesh_message = find_mesh_message(grbs)
+            if mesh_message is None:
+                raise RuntimeError(f"Could not find a MESH GRIB message in {use_path}")
+
+            values = _mask_to_float(mesh_message.values)
+            lats, lons = mesh_message.latlons()
+            lats = np.asarray(lats, dtype=float)
+            lons = np.asarray(lons, dtype=float)
+            lons = np.where(lons > 180.0, lons - 360.0, lons)
+
+            bbox_mask = (
+                (lats >= min_lat)
+                & (lats <= max_lat)
+                & (lons >= min_lon)
+                & (lons <= max_lon)
+            )
+            if not np.any(bbox_mask):
+                return []
+
+            sel_lats = lats[bbox_mask]
+            sel_lons = lons[bbox_mask]
+            sel_vals = values[bbox_mask]
+            sel_vals = np.where(np.isnan(sel_vals), 0.0, sel_vals)
+            sel_vals = np.where(sel_vals < 0.0, 0.0, sel_vals)
+
+            above_mask = sel_vals >= min_hail_mm
+            if not np.any(above_mask):
+                return []
+
+            result: list[tuple[float, float, float]] = []
+            for lat, lon, hail_mm in zip(sel_lats[above_mask], sel_lons[above_mask], sel_vals[above_mask], strict=True):
+                result.append((float(lat), float(lon), float(hail_mm)))
+            return result
     finally:
         if use_path != filename and use_path.exists():
             try:
@@ -551,7 +610,13 @@ def has_recent_alert_for_region(region_id: int, within_hours: int, exclude_alert
             return False
 
 
-def send_alert_email(region_name: str, hail_in: float, triggered_at: str) -> bool:
+def send_alert_email(
+    region_name: str,
+    hail_in: float,
+    triggered_at: str,
+    kml_filename: str | None = None,
+    kml_content: str | None = None,
+) -> bool:
     if not is_email_configured():
         logger.info("Email alert not configured; skipping send")
         return False
@@ -571,6 +636,17 @@ def send_alert_email(region_name: str, hail_in: float, triggered_at: str) -> boo
         f"<p><strong>Time:</strong> {triggered_at}</p>"
     )
 
+    attachments = None
+    if kml_filename and kml_content:
+        text += "Attached: damage map — open in Google Maps.\n"
+        html += "<p>Attached: damage map — open in Google Maps.</p>"
+        attachments = [
+            {
+                "filename": kml_filename,
+                "content": base64.b64encode(kml_content.encode("utf-8")).decode("ascii"),
+            }
+        ]
+
     headers = {
         "Authorization": f"Bearer {RESEND_API_KEY}",
         "Content-Type": "application/json",
@@ -583,6 +659,8 @@ def send_alert_email(region_name: str, hail_in: float, triggered_at: str) -> boo
         "text": text,
         "html": html,
     }
+    if attachments:
+        payload["attachments"] = attachments
 
     try:
         response = requests.post(endpoint, headers=headers, json=payload, timeout=30)
@@ -606,7 +684,14 @@ def send_alert_email(region_name: str, hail_in: float, triggered_at: str) -> boo
         return False
 
 
-def create_hail_alert(region: dict, mesh_url: str, mesh_source: str, hail_mm: float, hail_in: float) -> dict:
+def create_hail_alert(
+    region: dict,
+    mesh_url: str,
+    mesh_source: str,
+    hail_mm: float,
+    hail_in: float,
+    kml_cells: list[tuple[float, float, float]] | None = None,
+) -> dict:
     if region.get("id") is None:
         raise RuntimeError("Cannot create Supabase alert for a region without an id")
     # Idempotency: if an alert for this region+mesh already exists, return it
@@ -660,7 +745,23 @@ def create_hail_alert(region: dict, mesh_url: str, mesh_source: str, hail_mm: fl
         return alert
 
     triggered_at = alert.get("triggered_at") or (datetime.utcnow().replace(microsecond=0).isoformat() + "Z")
-    sent = send_alert_email(region.get("name") or region.get("slug") or "Unknown Region", hail_in, triggered_at)
+    region_name = region.get("name") or region.get("slug") or "Unknown Region"
+
+    kml_content = None
+    kml_filename = None
+    if kml_cells is not None:
+        event_date = triggered_at[:10]
+        kml_content = build_hail_swath_kml(kml_cells, region_name=region_name, event_date=event_date)
+        safe_region = re.sub(r"[^A-Za-z0-9_-]+", "-", region_name).strip("-") or "region"
+        kml_filename = f"damage-map-{safe_region}-{event_date}.kml"
+
+    sent = send_alert_email(
+        region_name,
+        hail_in,
+        triggered_at,
+        kml_filename=kml_filename,
+        kml_content=kml_content,
+    )
     if sent:
         try:
             email_sent_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -715,7 +816,15 @@ def process_regions(mesh_path: Path, mesh_url: str, mesh_source: str, dry_run: b
                 action = "active_alert"
             elif region.get("id") is not None:
                 if not dry_run:
-                    create_hail_alert(region, mesh_url, mesh_source, hail_mm, hail_in)
+                    kml_cells = read_mesh_cells_in_bbox_at_or_above(
+                        mesh_path,
+                        float(region["min_lat"]),
+                        float(region["min_lon"]),
+                        float(region["max_lat"]),
+                        float(region["max_lon"]),
+                        KML_DAMAGE_MIN_MM,
+                    )
+                    create_hail_alert(region, mesh_url, mesh_source, hail_mm, hail_in, kml_cells=kml_cells)
                     action = "created_alert"
                 else:
                     action = "would_create_alert"
