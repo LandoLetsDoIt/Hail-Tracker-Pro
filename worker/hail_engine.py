@@ -15,7 +15,11 @@ import numpy as np
 import pygrib
 import requests
 from dotenv import load_dotenv
-from kml_builder import build_hail_swath_kml
+
+try:
+    from kml_builder import build_hail_swath_kml
+except ModuleNotFoundError:
+    from worker.kml_builder import build_hail_swath_kml
 
 # Load environment variables from .env at project root
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")

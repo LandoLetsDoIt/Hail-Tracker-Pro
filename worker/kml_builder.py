@@ -12,8 +12,8 @@ def _hail_color_aabbggrr(hail_mm: float, min_mm: float = 19.0, max_mm: float = 8
     ratio = max(0.0, min(1.0, ratio))
 
     gb = int(round(220 - (220 * ratio)))
-    # KML color format: aabbggrr
-    return f"ff{gb:02x}{gb:02x}ff"
+    # Returns bbggrr component; alpha is applied separately per style target.
+    return f"{gb:02x}{gb:02x}ff"
 
 
 def build_hail_swath_kml(
@@ -31,7 +31,9 @@ def build_hail_swath_kml(
 
     for idx, (lat, lon, hail_mm) in enumerate(cells, start=1):
         style_id = f"cell-style-{idx}"
-        color = _hail_color_aabbggrr(hail_mm)
+        bbggrr = _hail_color_aabbggrr(hail_mm)
+        fill_color = f"4D{bbggrr}"
+        line_color = f"B3{bbggrr}"
 
         min_lat = lat - half
         max_lat = lat + half
@@ -39,8 +41,8 @@ def build_hail_swath_kml(
         max_lon = lon + half
 
         style_lines.append(
-            f"<Style id=\"{style_id}\"><LineStyle><color>{color}</color><width>1</width></LineStyle>"
-            f"<PolyStyle><color>{color}</color><fill>1</fill><outline>1</outline></PolyStyle></Style>"
+            f"<Style id=\"{style_id}\"><LineStyle><color>{line_color}</color><width>1</width></LineStyle>"
+            f"<PolyStyle><color>{fill_color}</color><fill>1</fill><outline>1</outline></PolyStyle></Style>"
         )
 
         placemark_lines.append(
