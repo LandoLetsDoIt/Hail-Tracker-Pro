@@ -50,3 +50,4 @@ __pycache__/
 *.grib2
 *.grib2.gz
 miniconda.exe
+worker/test_outputs/
