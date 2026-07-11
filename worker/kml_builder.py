@@ -22,6 +22,7 @@ def build_hail_swath_kml(
     event_date: str,
     folder_name: str = "Damage Map",
     cell_size_deg: float = 0.01,
+    canvass_targets: list[dict] | None = None,
 ) -> str:
     doc_name = f"{region_name} damage map {event_date}"
     half = cell_size_deg / 2.0
@@ -60,14 +61,52 @@ def build_hail_swath_kml(
             "</Placemark>"
         )
 
+    targets_style = (
+        "<Style id=\"canvass-pin\">"
+        "<IconStyle><scale>1.1</scale><Icon><href>http://maps.google.com/mapfiles/kml/paddle/red-circle.png</href></Icon></IconStyle>"
+        "<LabelStyle><scale>1.0</scale></LabelStyle>"
+        "</Style>"
+    )
+
+    target_lines = []
+    for target in canvass_targets or []:
+        lat = float(target.get("centroid_lat") or 0.0)
+        lon = float(target.get("centroid_lon") or 0.0)
+        rank = int(target.get("rank") or 0)
+        score = int(target.get("score") or 0)
+        tag = str(target.get("profile_tag") or "target")
+        hail_in = float(target.get("hail_in") or 0.0)
+        geoid = str(target.get("geoid") or "")
+        name = f"#{rank} [score {score}] {tag} — {hail_in:.1f}in"
+        description = f"GEOID {geoid}; hail {hail_in:.2f} in; profile {tag}; score {score}"
+        target_lines.append(
+            "<Placemark>"
+            f"<name>{escape(name)}</name>"
+            f"<description>{escape(description)}</description>"
+            "<styleUrl>#canvass-pin</styleUrl>"
+            f"<Point><coordinates>{lon:.6f},{lat:.6f},0</coordinates></Point>"
+            "</Placemark>"
+        )
+
+    targets_folder = ""
+    if target_lines:
+        targets_folder = (
+            "<Folder><name>Canvass Targets</name>"
+            + "".join(target_lines)
+            + "</Folder>"
+        )
+
     kml = (
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
         "<kml xmlns=\"http://www.opengis.net/kml/2.2\">"
         "<Document>"
         f"<name>{escape(doc_name)}</name>"
+        + targets_style
         + "".join(style_lines)
         + f"<Folder><name>{escape(folder_name)}</name>"
         + "".join(placemark_lines)
-        + "</Folder></Document></kml>"
+        + "</Folder>"
+        + targets_folder
+        + "</Document></kml>"
     )
     return kml

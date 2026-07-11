@@ -21,6 +21,11 @@ try:
 except ModuleNotFoundError:
     from worker.kml_builder import build_hail_swath_kml
 
+try:
+    from canvass_score import score_canvass_targets
+except ModuleNotFoundError:
+    from worker.canvass_score import score_canvass_targets
+
 # Load environment variables from .env at project root
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
@@ -484,6 +489,26 @@ def _slugify(value: str) -> str:
     return normalized.strip("-") or "region"
 
 
+def derive_alert_timestamp(source: str | None) -> str:
+    if source:
+        source_name = Path(urlparse(source).path).name or Path(source).name
+        match = re.search(r"(\d{8})-(\d{6})", source_name)
+        if match:
+            try:
+                # Archive/backtest files encode a file timestamp, not necessarily the exact storm-hit time.
+                # For MESH_Max_1440min daily maxima, this is the window-close timestamp, so timing points are
+                # approximate in daily-max backtests and exact in live 60-minute operation.
+                dt = datetime.strptime(
+                    f"{match.group(1)}{match.group(2)}",
+                    "%Y%m%d%H%M%S",
+                ).replace(tzinfo=timezone.utc)
+                return dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            except ValueError:
+                pass
+
+    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
 def _normalize_region_record(region: dict) -> dict:
     region_name = region.get("name") or region.get("slug") or "Unnamed Region"
     state = region.get("state")
@@ -620,6 +645,7 @@ def send_alert_email(
     triggered_at: str,
     kml_filename: str | None = None,
     kml_content: str | None = None,
+    top_canvass_targets: list[dict] | None = None,
 ) -> bool:
     if not is_email_configured():
         logger.info("Email alert not configured; skipping send")
@@ -639,6 +665,18 @@ def send_alert_email(
         f"<p><strong>Hail size:</strong> {hail_in:.2f} in</p>"
         f"<p><strong>Time:</strong> {triggered_at}</p>"
     )
+
+    if top_canvass_targets:
+        text += "\nTOP CANVASS TARGETS\n"
+        html += "<h3>TOP CANVASS TARGETS</h3><ul>"
+        for idx, target in enumerate(top_canvass_targets[:5], start=1):
+            line = (
+                f"{idx}. {target.get('geoid')} | score {int(target.get('score') or 0)} | "
+                f"{str(target.get('profile_tag') or 'target')} | {float(target.get('hail_in') or 0.0):.2f} in"
+            )
+            text += line + "\n"
+            html += f"<li>{line}</li>"
+        html += "</ul>"
 
     attachments = None
     if kml_filename and kml_content:
@@ -695,6 +733,8 @@ def create_hail_alert(
     hail_mm: float,
     hail_in: float,
     kml_cells: list[tuple[float, float, float]] | None = None,
+    alert_timestamp: str | None = None,
+    print_scores: bool = False,
 ) -> dict:
     if region.get("id") is None:
         raise RuntimeError("Cannot create Supabase alert for a region without an id")
@@ -711,6 +751,7 @@ def create_hail_alert(
         "hail_mm": hail_mm,
         "hail_in": hail_in,
         "threshold_mm": float(region.get("threshold_mm") or 0.0),
+        "triggered_at": alert_timestamp or datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
     }
     headers = {"Prefer": "return=representation"}
     response = supabase_request(
@@ -748,14 +789,42 @@ def create_hail_alert(
         )
         return alert
 
-    triggered_at = alert.get("triggered_at") or (datetime.utcnow().replace(microsecond=0).isoformat() + "Z")
+    triggered_at = alert.get("triggered_at") or alert_timestamp or (datetime.utcnow().replace(microsecond=0).isoformat() + "Z")
     region_name = region.get("name") or region.get("slug") or "Unknown Region"
+
+    canvass_targets: list[dict] = []
+    if kml_cells and region.get("id") is not None:
+        try:
+            canvass_targets = score_canvass_targets(
+                swath_cells=kml_cells,
+                region_id=int(region["id"]),
+                alert_timestamp=triggered_at,
+            )
+            if not canvass_targets:
+                logger.info("No tract_scores rows or no hail-gated tracts for region %s; skipping canvass scoring", region.get("id"))
+        except Exception as exc:
+            logger.warning("Canvass scoring failed for region %s; continuing alert flow: %s", region.get("id"), exc)
+            canvass_targets = []
+
+    if print_scores and canvass_targets:
+        print(f"--- CANVASS SCORES: {region_name} ---")
+        print("RANK  GEOID         SCORE  HAIL_IN  TAG")
+        for row in canvass_targets:
+            print(
+                f"{int(row['rank']):>4}  {row['geoid']:<12} {int(row['score']):>5}  "
+                f"{float(row['hail_in']):>7.2f}  {row['profile_tag']}"
+            )
 
     kml_content = None
     kml_filename = None
     if kml_cells is not None:
         event_date = triggered_at[:10]
-        kml_content = build_hail_swath_kml(kml_cells, region_name=region_name, event_date=event_date)
+        kml_content = build_hail_swath_kml(
+            kml_cells,
+            region_name=region_name,
+            event_date=event_date,
+            canvass_targets=canvass_targets[:10],
+        )
         safe_region = re.sub(r"[^A-Za-z0-9_-]+", "-", region_name).strip("-") or "region"
         kml_filename = f"damage-map-{safe_region}-{event_date}.kml"
 
@@ -765,6 +834,7 @@ def create_hail_alert(
         triggered_at,
         kml_filename=kml_filename,
         kml_content=kml_content,
+        top_canvass_targets=canvass_targets[:5],
     )
     if sent:
         try:
@@ -797,9 +867,24 @@ def clear_hail_alert(alert_id: int) -> None:
     logger.info("Cleared alert id=%s", alert_id)
 
 
-def process_regions(mesh_path: Path, mesh_url: str, mesh_source: str, dry_run: bool = False) -> list[dict]:
+def process_regions(
+    mesh_path: Path,
+    mesh_url: str,
+    mesh_source: str,
+    dry_run: bool = False,
+    print_scores: bool = False,
+) -> list[dict]:
     regions = load_active_regions()
     results = []
+    alert_timestamp = derive_alert_timestamp(mesh_url or mesh_source)
+    source_name = Path(urlparse(mesh_url or mesh_source).path).name if (mesh_url or mesh_source) else ""
+
+    if "MESH_Max_1440min" in source_name:
+        logger.info(
+            "Timing points for %s are using the file window-close timestamp %s; daily-max backtests are approximate, live 60-minute runs are exact",
+            source_name,
+            alert_timestamp,
+        )
 
     for region in regions:
         threshold_mm = float(region["threshold_mm"])
@@ -818,19 +903,69 @@ def process_regions(mesh_path: Path, mesh_url: str, mesh_source: str, dry_run: b
         if triggered:
             if active_alert:
                 action = "active_alert"
+                if print_scores and region.get("id") is not None:
+                    try:
+                        kml_cells = read_mesh_cells_in_bbox_at_or_above(
+                            mesh_path,
+                            float(region["min_lat"]),
+                            float(region["min_lon"]),
+                            float(region["max_lat"]),
+                            float(region["max_lon"]),
+                            KML_DAMAGE_MIN_MM,
+                        )
+                        scored = score_canvass_targets(
+                            swath_cells=kml_cells,
+                            region_id=int(region["id"]),
+                            alert_timestamp=alert_timestamp,
+                        )
+                        print(f"--- CANVASS SCORES: {region.get('name') or region.get('slug')} ---")
+                        print("RANK  GEOID         SCORE  HAIL_IN  TAG")
+                        for row in scored:
+                            print(
+                                f"{int(row['rank']):>4}  {row['geoid']:<12} {int(row['score']):>5}  "
+                                f"{float(row['hail_in']):>7.2f}  {row['profile_tag']}"
+                            )
+                    except Exception as exc:
+                        logger.warning("Canvass score print failed for region %s: %s", region.get("id"), exc)
             elif region.get("id") is not None:
+                kml_cells = read_mesh_cells_in_bbox_at_or_above(
+                    mesh_path,
+                    float(region["min_lat"]),
+                    float(region["min_lon"]),
+                    float(region["max_lat"]),
+                    float(region["max_lon"]),
+                    KML_DAMAGE_MIN_MM,
+                )
+
                 if not dry_run:
-                    kml_cells = read_mesh_cells_in_bbox_at_or_above(
-                        mesh_path,
-                        float(region["min_lat"]),
-                        float(region["min_lon"]),
-                        float(region["max_lat"]),
-                        float(region["max_lon"]),
-                        KML_DAMAGE_MIN_MM,
+                    create_hail_alert(
+                        region,
+                        mesh_url,
+                        mesh_source,
+                        hail_mm,
+                        hail_in,
+                        kml_cells=kml_cells,
+                        alert_timestamp=alert_timestamp,
+                        print_scores=print_scores,
                     )
-                    create_hail_alert(region, mesh_url, mesh_source, hail_mm, hail_in, kml_cells=kml_cells)
                     action = "created_alert"
                 else:
+                    if print_scores and region.get("id") is not None:
+                        try:
+                            scored = score_canvass_targets(
+                                swath_cells=kml_cells,
+                                region_id=int(region["id"]),
+                                alert_timestamp=alert_timestamp,
+                            )
+                            print(f"--- CANVASS SCORES: {region.get('name') or region.get('slug')} ---")
+                            print("RANK  GEOID         SCORE  HAIL_IN  TAG")
+                            for row in scored:
+                                print(
+                                    f"{int(row['rank']):>4}  {row['geoid']:<12} {int(row['score']):>5}  "
+                                    f"{float(row['hail_in']):>7.2f}  {row['profile_tag']}"
+                                )
+                        except Exception as exc:
+                            logger.warning("Canvass score print failed for region %s: %s", region.get("id"), exc)
                     action = "would_create_alert"
             else:
                 action = "threshold_exceeded_no_db"
@@ -897,6 +1032,11 @@ def main() -> int:
         help="Do not write Supabase alerts; only print what would happen",
     )
     parser.add_argument(
+        "--print-scores",
+        action="store_true",
+        help="Print full scored tract list for triggered regions during scan",
+    )
+    parser.add_argument(
         "--email-smoke-test",
         action="store_true",
         help="Send a single test email via Resend and exit (no NOAA/Supabase usage)",
@@ -950,7 +1090,13 @@ def main() -> int:
     print(f"Hail size at point: {hail_mm:.2f} mm / {hail_in:.2f} in")
 
     if args.scan_regions:
-        results = process_regions(mesh_path, resolved_source, resolved_source or source, dry_run=args.dry_run)
+        results = process_regions(
+            mesh_path,
+            resolved_source,
+            resolved_source or source,
+            dry_run=args.dry_run,
+            print_scores=args.print_scores,
+        )
         print("--- REGION SCAN ---")
         for item in results:
             print(
