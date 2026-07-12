@@ -105,15 +105,17 @@ def build_hail_swath_kml(
     )
 
     dealership_lines = []
+    independent_lines = []
     for hit in dealership_hits or []:
         lat = float(hit.get("lat") or 0.0)
         lon = float(hit.get("lon") or 0.0)
         name = str(hit.get("name") or "Dealership")
         hail_in = float(hit.get("hail_in") or 0.0)
         brand = str(hit.get("brand") or "")
+        tier = str(hit.get("tier") or "independent")
         label = f"{name} — {hail_in:.1f}in"
-        description = f"{name}; brand={brand or 'n/a'}; hail={hail_in:.2f} in"
-        dealership_lines.append(
+        description = f"{name}; tier={tier}; brand={brand or 'n/a'}; hail={hail_in:.2f} in"
+        placemark = (
             "<Placemark>"
             f"<name>{escape(label)}</name>"
             f"<description>{escape(description)}</description>"
@@ -121,12 +123,24 @@ def build_hail_swath_kml(
             f"<Point><coordinates>{lon:.6f},{lat:.6f},0</coordinates></Point>"
             "</Placemark>"
         )
+        if tier == "independent":
+            independent_lines.append(placemark)
+        else:
+            dealership_lines.append(placemark)
 
     dealerships_folder = ""
     if dealership_lines:
         dealerships_folder = (
             "<Folder><name>Dealership Hits</name>"
             + "".join(dealership_lines)
+            + "</Folder>"
+        )
+
+    independent_folder = ""
+    if independent_lines:
+        independent_folder = (
+            "<Folder><name>Independent Lots</name>"
+            + "".join(independent_lines)
             + "</Folder>"
         )
 
@@ -143,6 +157,7 @@ def build_hail_swath_kml(
         + "</Folder>"
         + targets_folder
         + dealerships_folder
+        + independent_folder
         + "</Document></kml>"
     )
     return kml

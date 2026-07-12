@@ -48,6 +48,32 @@ SPRINGFIELD_LAT = 37.21
 SPRINGFIELD_LON = -93.29
 MM_PER_INCH = 25.4
 KML_DAMAGE_MIN_MM = 19.0
+MAJOR_BRAND_TOKENS = [
+    "chevrolet",
+    "chevy",
+    "ford",
+    "toyota",
+    "honda",
+    "nissan",
+    "kia",
+    "hyundai",
+    "gmc",
+    "buick",
+    "ram",
+    "dodge",
+    "jeep",
+    "chrysler",
+    "subaru",
+    "mazda",
+    "vw",
+    "volkswagen",
+    "bmw",
+    "mercedes",
+    "lexus",
+    "audi",
+    "carmax",
+    "autonation",
+]
 
 logger = logging.getLogger("hail_engine")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -566,17 +592,48 @@ def get_active_region_alert(region_id: int) -> dict | None:
     return alerts[0] if alerts else None
 
 
+def classify_dealership_tier(name: str, brand: str | None) -> str:
+    name_lower = name.lower()
+    brand_text = (brand or "").strip()
+    if brand_text:
+        return "franchise"
+    if any(token in name_lower for token in MAJOR_BRAND_TOKENS):
+        return "franchise"
+    if "auction" in name_lower:
+        return "auction"
+    return "independent"
+
+
 def load_active_dealerships(region_id: int) -> list[dict]:
     if not is_supabase_configured() or region_id is None:
         return []
 
     params = {
+        "select": "id,region_id,name,brand,tier,lat,lon,osm_id,active",
+        "region_id": f"eq.{region_id}",
+        "active": "eq.true",
+    }
+    try:
+        response = supabase_request("GET", SUPABASE_TABLE_DEALERSHIPS, params=params)
+        return response.json() or []
+    except Exception as exc:
+        message = str(exc)
+        if (
+            "Could not find the 'tier' column of 'dealerships'" not in message
+            and "column dealerships.tier does not exist" not in message
+        ):
+            raise
+
+    fallback_params = {
         "select": "id,region_id,name,brand,lat,lon,osm_id,active",
         "region_id": f"eq.{region_id}",
         "active": "eq.true",
     }
-    response = supabase_request("GET", SUPABASE_TABLE_DEALERSHIPS, params=params)
-    return response.json() or []
+    response = supabase_request("GET", SUPABASE_TABLE_DEALERSHIPS, params=fallback_params)
+    rows = response.json() or []
+    for row in rows:
+        row["tier"] = classify_dealership_tier(str(row.get("name") or ""), row.get("brand"))
+    return rows
 
 
 def _cell_contains_point_1km(cell_lat: float, cell_lon: float, point_lat: float, point_lon: float) -> bool:
@@ -616,6 +673,7 @@ def detect_dealership_hits(
             {
                 "name": str(dealer.get("name") or "Dealership"),
                 "brand": dealer.get("brand"),
+                "tier": str(dealer.get("tier") or "independent"),
                 "hail_mm": float(max_hail_mm),
                 "hail_in": mm_to_inches(float(max_hail_mm)),
                 "lat": dlat,
@@ -634,9 +692,17 @@ def print_dealership_hits(region_name: str, hits: list[dict]) -> None:
         print("none")
         return
 
-    print("NAME  HAIL_IN")
-    for hit in hits:
-        print(f"{hit['name']}  {float(hit['hail_in']):.2f}")
+    primary_hits = [h for h in hits if str(h.get("tier") or "") in ("franchise", "auction")]
+    independent_count = len([h for h in hits if str(h.get("tier") or "") == "independent"])
+
+    if primary_hits:
+        print("NAME  TIER  HAIL_IN")
+        for hit in primary_hits:
+            print(f"{hit['name']}  {hit.get('tier')}  {float(hit['hail_in']):.2f}")
+    else:
+        print("none")
+
+    print(f"+ {independent_count} independent lots also in swath (see map)")
 
 
 def find_alert_by_region_and_mesh(region_id: int, mesh_url: str) -> dict | None:
@@ -754,13 +820,28 @@ def send_alert_email(
         html += "</ul>"
 
     if dealership_hits:
+        primary_hits = [
+            hit
+            for hit in dealership_hits
+            if str(hit.get("tier") or "") in ("franchise", "auction")
+        ]
+        independent_count = len(
+            [hit for hit in dealership_hits if str(hit.get("tier") or "") == "independent"]
+        )
+
         text += "\nDEALERSHIPS IN SWATH\n"
         html += "<h3>DEALERSHIPS IN SWATH</h3><ul>"
-        for hit in dealership_hits:
-            line = f"{hit.get('name')} | {float(hit.get('hail_in') or 0.0):.2f} in"
+        for hit in primary_hits:
+            line = (
+                f"{hit.get('name')} | {str(hit.get('tier') or 'dealership')} | "
+                f"{float(hit.get('hail_in') or 0.0):.2f} in"
+            )
             text += line + "\n"
             html += f"<li>{line}</li>"
         html += "</ul>"
+        footer = f"+ {independent_count} independent lots also in swath (see map)"
+        text += footer + "\n"
+        html += f"<p>{footer}</p>"
 
     attachments = None
     if kml_filename and kml_content:
