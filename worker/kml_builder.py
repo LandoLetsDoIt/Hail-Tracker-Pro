@@ -23,6 +23,7 @@ def build_hail_swath_kml(
     folder_name: str = "Damage Map",
     cell_size_deg: float = 0.01,
     canvass_targets: list[dict] | None = None,
+    dealership_hits: list[dict] | None = None,
 ) -> str:
     doc_name = f"{region_name} damage map {event_date}"
     half = cell_size_deg / 2.0
@@ -96,17 +97,52 @@ def build_hail_swath_kml(
             + "</Folder>"
         )
 
+    dealership_style = (
+        "<Style id=\"dealership-pin\">"
+        "<IconStyle><scale>1.1</scale><Icon><href>http://maps.google.com/mapfiles/kml/paddle/wht-blank.png</href></Icon></IconStyle>"
+        "<LabelStyle><scale>1.0</scale></LabelStyle>"
+        "</Style>"
+    )
+
+    dealership_lines = []
+    for hit in dealership_hits or []:
+        lat = float(hit.get("lat") or 0.0)
+        lon = float(hit.get("lon") or 0.0)
+        name = str(hit.get("name") or "Dealership")
+        hail_in = float(hit.get("hail_in") or 0.0)
+        brand = str(hit.get("brand") or "")
+        label = f"{name} — {hail_in:.1f}in"
+        description = f"{name}; brand={brand or 'n/a'}; hail={hail_in:.2f} in"
+        dealership_lines.append(
+            "<Placemark>"
+            f"<name>{escape(label)}</name>"
+            f"<description>{escape(description)}</description>"
+            "<styleUrl>#dealership-pin</styleUrl>"
+            f"<Point><coordinates>{lon:.6f},{lat:.6f},0</coordinates></Point>"
+            "</Placemark>"
+        )
+
+    dealerships_folder = ""
+    if dealership_lines:
+        dealerships_folder = (
+            "<Folder><name>Dealership Hits</name>"
+            + "".join(dealership_lines)
+            + "</Folder>"
+        )
+
     kml = (
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
         "<kml xmlns=\"http://www.opengis.net/kml/2.2\">"
         "<Document>"
         f"<name>{escape(doc_name)}</name>"
         + targets_style
+        + dealership_style
         + "".join(style_lines)
         + f"<Folder><name>{escape(folder_name)}</name>"
         + "".join(placemark_lines)
         + "</Folder>"
         + targets_folder
+        + dealerships_folder
         + "</Document></kml>"
     )
     return kml

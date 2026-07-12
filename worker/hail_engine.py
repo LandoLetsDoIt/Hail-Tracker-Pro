@@ -56,6 +56,7 @@ SUPABASE_URL = os.getenv("SUPABASE_URL") or os.getenv("NEXT_PUBLIC_SUPABASE_URL"
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 SUPABASE_TABLE_REGIONS = "regions"
 SUPABASE_TABLE_ALERTS = "hail_alerts"
+SUPABASE_TABLE_DEALERSHIPS = "dealerships"
 RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 ALERT_EMAIL_TO = os.getenv("ALERT_EMAIL_TO")
 RESEND_FROM_EMAIL = "onboarding@resend.dev"
@@ -565,6 +566,79 @@ def get_active_region_alert(region_id: int) -> dict | None:
     return alerts[0] if alerts else None
 
 
+def load_active_dealerships(region_id: int) -> list[dict]:
+    if not is_supabase_configured() or region_id is None:
+        return []
+
+    params = {
+        "select": "id,region_id,name,brand,lat,lon,osm_id,active",
+        "region_id": f"eq.{region_id}",
+        "active": "eq.true",
+    }
+    response = supabase_request("GET", SUPABASE_TABLE_DEALERSHIPS, params=params)
+    return response.json() or []
+
+
+def _cell_contains_point_1km(cell_lat: float, cell_lon: float, point_lat: float, point_lon: float) -> bool:
+    # Approximate 1km grid footprint as a 1km square centered at the MRMS cell center.
+    half_km = 0.5
+    lat_km = abs(point_lat - cell_lat) * 111.32
+    lon_scale = 111.32 * max(0.1, abs(np.cos(np.radians(cell_lat))))
+    lon_km = abs(point_lon - cell_lon) * lon_scale
+    return lat_km <= half_km and lon_km <= half_km
+
+
+def detect_dealership_hits(
+    dealerships: list[dict],
+    swath_cells: list[tuple[float, float, float]],
+    threshold_mm: float,
+) -> list[dict]:
+    threshold_cells = [c for c in swath_cells if float(c[2]) >= threshold_mm]
+    if not threshold_cells or not dealerships:
+        return []
+
+    hits: list[dict] = []
+
+    for dealer in dealerships:
+        dlat = float(dealer.get("lat") or 0.0)
+        dlon = float(dealer.get("lon") or 0.0)
+
+        max_hail_mm = None
+        for clat, clon, hail_mm in threshold_cells:
+            if _cell_contains_point_1km(float(clat), float(clon), dlat, dlon):
+                if max_hail_mm is None or float(hail_mm) > max_hail_mm:
+                    max_hail_mm = float(hail_mm)
+
+        if max_hail_mm is None:
+            continue
+
+        hits.append(
+            {
+                "name": str(dealer.get("name") or "Dealership"),
+                "brand": dealer.get("brand"),
+                "hail_mm": float(max_hail_mm),
+                "hail_in": mm_to_inches(float(max_hail_mm)),
+                "lat": dlat,
+                "lon": dlon,
+                "osm_id": dealer.get("osm_id"),
+            }
+        )
+
+    hits.sort(key=lambda x: x["hail_mm"], reverse=True)
+    return hits
+
+
+def print_dealership_hits(region_name: str, hits: list[dict]) -> None:
+    print(f"--- DEALERSHIPS IN SWATH: {region_name} ---")
+    if not hits:
+        print("none")
+        return
+
+    print("NAME  HAIL_IN")
+    for hit in hits:
+        print(f"{hit['name']}  {float(hit['hail_in']):.2f}")
+
+
 def find_alert_by_region_and_mesh(region_id: int, mesh_url: str) -> dict | None:
     if not is_supabase_configured() or region_id is None or not mesh_url:
         return None
@@ -646,6 +720,7 @@ def send_alert_email(
     kml_filename: str | None = None,
     kml_content: str | None = None,
     top_canvass_targets: list[dict] | None = None,
+    dealership_hits: list[dict] | None = None,
 ) -> bool:
     if not is_email_configured():
         logger.info("Email alert not configured; skipping send")
@@ -674,6 +749,15 @@ def send_alert_email(
                 f"{idx}. {target.get('geoid')} | score {int(target.get('score') or 0)} | "
                 f"{str(target.get('profile_tag') or 'target')} | {float(target.get('hail_in') or 0.0):.2f} in"
             )
+            text += line + "\n"
+            html += f"<li>{line}</li>"
+        html += "</ul>"
+
+    if dealership_hits:
+        text += "\nDEALERSHIPS IN SWATH\n"
+        html += "<h3>DEALERSHIPS IN SWATH</h3><ul>"
+        for hit in dealership_hits:
+            line = f"{hit.get('name')} | {float(hit.get('hail_in') or 0.0):.2f} in"
             text += line + "\n"
             html += f"<li>{line}</li>"
         html += "</ul>"
@@ -733,6 +817,7 @@ def create_hail_alert(
     hail_mm: float,
     hail_in: float,
     kml_cells: list[tuple[float, float, float]] | None = None,
+    dealership_hits: list[dict] | None = None,
     alert_timestamp: str | None = None,
     print_scores: bool = False,
 ) -> dict:
@@ -824,6 +909,7 @@ def create_hail_alert(
             region_name=region_name,
             event_date=event_date,
             canvass_targets=canvass_targets[:10],
+            dealership_hits=dealership_hits or [],
         )
         safe_region = re.sub(r"[^A-Za-z0-9_-]+", "-", region_name).strip("-") or "region"
         kml_filename = f"damage-map-{safe_region}-{event_date}.kml"
@@ -835,6 +921,7 @@ def create_hail_alert(
         kml_filename=kml_filename,
         kml_content=kml_content,
         top_canvass_targets=canvass_targets[:5],
+        dealership_hits=dealership_hits or [],
     )
     if sent:
         try:
@@ -927,6 +1014,12 @@ def process_regions(
                             )
                     except Exception as exc:
                         logger.warning("Canvass score print failed for region %s: %s", region.get("id"), exc)
+                    try:
+                        dealerships = load_active_dealerships(int(region["id"]))
+                        dealership_hits = detect_dealership_hits(dealerships, kml_cells, threshold_mm)
+                        print_dealership_hits(region.get("name") or region.get("slug") or "Region", dealership_hits)
+                    except Exception as exc:
+                        logger.warning("Dealership hit print failed for region %s: %s", region.get("id"), exc)
             elif region.get("id") is not None:
                 kml_cells = read_mesh_cells_in_bbox_at_or_above(
                     mesh_path,
@@ -937,6 +1030,17 @@ def process_regions(
                     KML_DAMAGE_MIN_MM,
                 )
 
+                dealership_hits: list[dict] = []
+                try:
+                    dealerships = load_active_dealerships(int(region["id"]))
+                    if dealerships:
+                        dealership_hits = detect_dealership_hits(dealerships, kml_cells, threshold_mm)
+                    else:
+                        logger.info("No dealerships loaded for region %s; skipping dealership hit detection", region.get("id"))
+                except Exception as exc:
+                    logger.warning("Dealership hit detection failed for region %s; continuing alert flow: %s", region.get("id"), exc)
+                    dealership_hits = []
+
                 if not dry_run:
                     create_hail_alert(
                         region,
@@ -945,6 +1049,7 @@ def process_regions(
                         hail_mm,
                         hail_in,
                         kml_cells=kml_cells,
+                        dealership_hits=dealership_hits,
                         alert_timestamp=alert_timestamp,
                         print_scores=print_scores,
                     )
@@ -966,6 +1071,10 @@ def process_regions(
                                 )
                         except Exception as exc:
                             logger.warning("Canvass score print failed for region %s: %s", region.get("id"), exc)
+                        try:
+                            print_dealership_hits(region.get("name") or region.get("slug") or "Region", dealership_hits)
+                        except Exception as exc:
+                            logger.warning("Dealership hit print failed for region %s: %s", region.get("id"), exc)
                     action = "would_create_alert"
             else:
                 action = "threshold_exceeded_no_db"
