@@ -64,7 +64,8 @@ def build_hail_swath_kml(
 
     targets_style = (
         "<Style id=\"canvass-pin\">"
-        "<IconStyle><scale>1.1</scale><Icon><href>http://maps.google.com/mapfiles/kml/paddle/red-circle.png</href></Icon></IconStyle>"
+        "<IconStyle><color>ff00a550</color><scale>1.1</scale>"
+        "<Icon><href>http://maps.google.com/mapfiles/kml/paddle/grn-square.png</href></Icon></IconStyle>"
         "<LabelStyle><scale>1.0</scale></LabelStyle>"
         "</Style>"
     )
@@ -97,9 +98,26 @@ def build_hail_swath_kml(
             + "</Folder>"
         )
 
-    dealership_style = (
-        "<Style id=\"dealership-pin\">"
-        "<IconStyle><scale>1.1</scale><Icon><href>http://maps.google.com/mapfiles/kml/paddle/wht-blank.png</href></Icon></IconStyle>"
+    dealership_auction_style = (
+        "<Style id=\"dealership-auction-pin\">"
+        "<IconStyle><color>ffb4508b</color><scale>1.4</scale>"
+        "<Icon><href>http://maps.google.com/mapfiles/kml/paddle/red-circle.png</href></Icon></IconStyle>"
+        "<LabelStyle><scale>1.0</scale></LabelStyle>"
+        "</Style>"
+    )
+
+    dealership_franchise_style = (
+        "<Style id=\"dealership-franchise-pin\">"
+        "<IconStyle><color>ff0099ff</color><scale>1.2</scale>"
+        "<Icon><href>http://maps.google.com/mapfiles/kml/paddle/orange-circle.png</href></Icon></IconStyle>"
+        "<LabelStyle><scale>1.0</scale></LabelStyle>"
+        "</Style>"
+    )
+
+    dealership_independent_style = (
+        "<Style id=\"dealership-independent-pin\">"
+        "<IconStyle><color>ff969696</color><scale>0.7</scale>"
+        "<Icon><href>http://maps.google.com/mapfiles/kml/shapes/placemark_circle.png</href></Icon></IconStyle>"
         "<LabelStyle><scale>1.0</scale></LabelStyle>"
         "</Style>"
     )
@@ -113,13 +131,23 @@ def build_hail_swath_kml(
         hail_in = float(hit.get("hail_in") or 0.0)
         brand = str(hit.get("brand") or "")
         tier = str(hit.get("tier") or "independent")
-        label = f"{name} — {hail_in:.1f}in"
+        if tier == "auction":
+            tier_prefix = "[AUCTION]"
+            style_url = "#dealership-auction-pin"
+        elif tier == "franchise":
+            tier_prefix = "[FRANCHISE]"
+            style_url = "#dealership-franchise-pin"
+        else:
+            tier_prefix = "[ind]"
+            style_url = "#dealership-independent-pin"
+
+        label = f"{tier_prefix} {name} — {hail_in:.2f}in"
         description = f"{name}; tier={tier}; brand={brand or 'n/a'}; hail={hail_in:.2f} in"
         placemark = (
             "<Placemark>"
             f"<name>{escape(label)}</name>"
             f"<description>{escape(description)}</description>"
-            "<styleUrl>#dealership-pin</styleUrl>"
+            f"<styleUrl>{style_url}</styleUrl>"
             f"<Point><coordinates>{lon:.6f},{lat:.6f},0</coordinates></Point>"
             "</Placemark>"
         )
@@ -150,7 +178,9 @@ def build_hail_swath_kml(
         "<Document>"
         f"<name>{escape(doc_name)}</name>"
         + targets_style
-        + dealership_style
+        + dealership_auction_style
+        + dealership_franchise_style
+        + dealership_independent_style
         + "".join(style_lines)
         + f"<Folder><name>{escape(folder_name)}</name>"
         + "".join(placemark_lines)

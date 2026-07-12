@@ -98,6 +98,7 @@ DEFAULT_WATCHED_REGIONS = [
         "max_lat": 37.32,
         "max_lon": -93.10,
         "threshold_mm": 25.4,
+        "dealer_threshold_mm": 12.7,
     }
 ]
 
@@ -552,6 +553,7 @@ def _normalize_region_record(region: dict) -> dict:
         "max_lat": float(region.get("max_lat") or region.get("lat_max") or 0.0),
         "max_lon": float(region.get("max_lon") or region.get("lon_max") or 0.0),
         "threshold_mm": float(region.get("threshold_mm") or 0.0),
+        "dealer_threshold_mm": float(region.get("dealer_threshold_mm") or 12.7),
         "email_enabled": bool(region.get("email_enabled", True)),
     }
 
@@ -787,13 +789,17 @@ def send_alert_email(
     kml_content: str | None = None,
     top_canvass_targets: list[dict] | None = None,
     dealership_hits: list[dict] | None = None,
+    dealer_only: bool = False,
 ) -> bool:
     if not is_email_configured():
         logger.info("Email alert not configured; skipping send")
         return False
 
     endpoint = "https://api.resend.com/emails"
-    subject = f"Hail Alert: {region_name} reached {hail_in:.2f}\""
+    subject_prefix = "Hail Alert"
+    if dealer_only:
+        subject_prefix = "Hail Alert [DEALER-ONLY]"
+    subject = f"{subject_prefix}: {region_name} reached {hail_in:.2f}\""
     text = (
         "New hail alert triggered.\n"
         f"Region: {region_name}\n"
@@ -806,6 +812,10 @@ def send_alert_email(
         f"<p><strong>Hail size:</strong> {hail_in:.2f} in</p>"
         f"<p><strong>Time:</strong> {triggered_at}</p>"
     )
+
+    if dealer_only:
+        text += "EVENT TYPE: DEALER-ONLY\n"
+        html += "<p><strong>EVENT TYPE:</strong> DEALER-ONLY</p>"
 
     if top_canvass_targets:
         text += "\nTOP CANVASS TARGETS\n"
@@ -900,6 +910,7 @@ def create_hail_alert(
     kml_cells: list[tuple[float, float, float]] | None = None,
     dealership_hits: list[dict] | None = None,
     alert_timestamp: str | None = None,
+    retail_triggered: bool = True,
     print_scores: bool = False,
 ) -> dict:
     if region.get("id") is None:
@@ -959,7 +970,7 @@ def create_hail_alert(
     region_name = region.get("name") or region.get("slug") or "Unknown Region"
 
     canvass_targets: list[dict] = []
-    if kml_cells and region.get("id") is not None:
+    if retail_triggered and kml_cells and region.get("id") is not None:
         try:
             canvass_targets = score_canvass_targets(
                 swath_cells=kml_cells,
@@ -1003,6 +1014,7 @@ def create_hail_alert(
         kml_content=kml_content,
         top_canvass_targets=canvass_targets[:5],
         dealership_hits=dealership_hits or [],
+        dealer_only=not retail_triggered,
     )
     if sent:
         try:
@@ -1056,6 +1068,7 @@ def process_regions(
 
     for region in regions:
         threshold_mm = float(region["threshold_mm"])
+        dealer_threshold_mm = float(region.get("dealer_threshold_mm") or 12.7)
         hail_mm = read_mesh_max_in_bbox(
             mesh_path,
             float(region["min_lat"]),
@@ -1065,7 +1078,9 @@ def process_regions(
         )
         hail_in = mm_to_inches(hail_mm)
         active_alert = get_active_region_alert(region.get("id"))
-        triggered = hail_mm >= threshold_mm
+        retail_triggered = hail_mm >= threshold_mm
+        dealer_triggered = hail_mm >= dealer_threshold_mm
+        triggered = retail_triggered or dealer_triggered
         action = "none"
 
         if triggered:
@@ -1081,23 +1096,32 @@ def process_regions(
                             float(region["max_lon"]),
                             KML_DAMAGE_MIN_MM,
                         )
-                        scored = score_canvass_targets(
-                            swath_cells=kml_cells,
-                            region_id=int(region["id"]),
-                            alert_timestamp=alert_timestamp,
-                        )
-                        print(f"--- CANVASS SCORES: {region.get('name') or region.get('slug')} ---")
-                        print("RANK  GEOID         SCORE  HAIL_IN  TAG")
-                        for row in scored:
-                            print(
-                                f"{int(row['rank']):>4}  {row['geoid']:<12} {int(row['score']):>5}  "
-                                f"{float(row['hail_in']):>7.2f}  {row['profile_tag']}"
+                        if retail_triggered:
+                            scored = score_canvass_targets(
+                                swath_cells=kml_cells,
+                                region_id=int(region["id"]),
+                                alert_timestamp=alert_timestamp,
                             )
+                            print(f"--- CANVASS SCORES: {region.get('name') or region.get('slug')} ---")
+                            print("RANK  GEOID         SCORE  HAIL_IN  TAG")
+                            for row in scored:
+                                print(
+                                    f"{int(row['rank']):>4}  {row['geoid']:<12} {int(row['score']):>5}  "
+                                    f"{float(row['hail_in']):>7.2f}  {row['profile_tag']}"
+                                )
                     except Exception as exc:
                         logger.warning("Canvass score print failed for region %s: %s", region.get("id"), exc)
                     try:
+                        dealer_cells = read_mesh_cells_in_bbox_at_or_above(
+                            mesh_path,
+                            float(region["min_lat"]),
+                            float(region["min_lon"]),
+                            float(region["max_lat"]),
+                            float(region["max_lon"]),
+                            dealer_threshold_mm,
+                        )
                         dealerships = load_active_dealerships(int(region["id"]))
-                        dealership_hits = detect_dealership_hits(dealerships, kml_cells, threshold_mm)
+                        dealership_hits = detect_dealership_hits(dealerships, dealer_cells, dealer_threshold_mm)
                         print_dealership_hits(region.get("name") or region.get("slug") or "Region", dealership_hits)
                     except Exception as exc:
                         logger.warning("Dealership hit print failed for region %s: %s", region.get("id"), exc)
@@ -1110,12 +1134,20 @@ def process_regions(
                     float(region["max_lon"]),
                     KML_DAMAGE_MIN_MM,
                 )
+                dealer_cells = read_mesh_cells_in_bbox_at_or_above(
+                    mesh_path,
+                    float(region["min_lat"]),
+                    float(region["min_lon"]),
+                    float(region["max_lat"]),
+                    float(region["max_lon"]),
+                    dealer_threshold_mm,
+                )
 
                 dealership_hits: list[dict] = []
                 try:
                     dealerships = load_active_dealerships(int(region["id"]))
                     if dealerships:
-                        dealership_hits = detect_dealership_hits(dealerships, kml_cells, threshold_mm)
+                        dealership_hits = detect_dealership_hits(dealerships, dealer_cells, dealer_threshold_mm)
                     else:
                         logger.info("No dealerships loaded for region %s; skipping dealership hit detection", region.get("id"))
                 except Exception as exc:
@@ -1132,24 +1164,26 @@ def process_regions(
                         kml_cells=kml_cells,
                         dealership_hits=dealership_hits,
                         alert_timestamp=alert_timestamp,
+                        retail_triggered=retail_triggered,
                         print_scores=print_scores,
                     )
                     action = "created_alert"
                 else:
                     if print_scores and region.get("id") is not None:
                         try:
-                            scored = score_canvass_targets(
-                                swath_cells=kml_cells,
-                                region_id=int(region["id"]),
-                                alert_timestamp=alert_timestamp,
-                            )
-                            print(f"--- CANVASS SCORES: {region.get('name') or region.get('slug')} ---")
-                            print("RANK  GEOID         SCORE  HAIL_IN  TAG")
-                            for row in scored:
-                                print(
-                                    f"{int(row['rank']):>4}  {row['geoid']:<12} {int(row['score']):>5}  "
-                                    f"{float(row['hail_in']):>7.2f}  {row['profile_tag']}"
+                            if retail_triggered:
+                                scored = score_canvass_targets(
+                                    swath_cells=kml_cells,
+                                    region_id=int(region["id"]),
+                                    alert_timestamp=alert_timestamp,
                                 )
+                                print(f"--- CANVASS SCORES: {region.get('name') or region.get('slug')} ---")
+                                print("RANK  GEOID         SCORE  HAIL_IN  TAG")
+                                for row in scored:
+                                    print(
+                                        f"{int(row['rank']):>4}  {row['geoid']:<12} {int(row['score']):>5}  "
+                                        f"{float(row['hail_in']):>7.2f}  {row['profile_tag']}"
+                                    )
                         except Exception as exc:
                             logger.warning("Canvass score print failed for region %s: %s", region.get("id"), exc)
                         try:
@@ -1175,15 +1209,21 @@ def process_regions(
             "hail_mm": hail_mm,
             "hail_in": hail_in,
             "threshold_mm": threshold_mm,
+            "dealer_threshold_mm": dealer_threshold_mm,
+            "retail_triggered": retail_triggered,
+            "dealer_triggered": dealer_triggered,
             "triggered": triggered,
             "action": action,
         }
         logger.info(
-            "Region %s: hail=%.2f mm (%.2f in), threshold=%.2f mm, action=%s",
+            "Region %s: hail=%.2f mm (%.2f in), retail_threshold=%.2f mm, dealer_threshold=%.2f mm, retail_triggered=%s, dealer_triggered=%s, action=%s",
             summary["region"],
             hail_mm,
             hail_in,
             threshold_mm,
+            dealer_threshold_mm,
+            retail_triggered,
+            dealer_triggered,
             action,
         )
         results.append(summary)
