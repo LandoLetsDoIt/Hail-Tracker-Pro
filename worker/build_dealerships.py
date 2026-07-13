@@ -40,6 +40,9 @@ MAJOR_BRAND_TOKENS = [
     "mercedes",
     "lexus",
     "audi",
+]
+
+USED_CAR_SUPERSTORE_TOKENS = [
     "carmax",
     "autonation",
 ]
@@ -179,10 +182,14 @@ def _feature_center(element: dict[str, Any]) -> tuple[float, float] | None:
 def classify_tier(name: str, brand: str | None) -> str:
     name_lower = name.lower()
     brand_text = (brand or "").strip()
+    brand_lower = brand_text.lower()
+    is_used_car_superstore = any(token in name_lower for token in USED_CAR_SUPERSTORE_TOKENS) or any(
+        token in brand_lower for token in USED_CAR_SUPERSTORE_TOKENS
+    )
 
-    if brand_text:
+    if brand_text and not is_used_car_superstore:
         return "franchise"
-    if any(token in name_lower for token in MAJOR_BRAND_TOKENS):
+    if any(token in name_lower for token in MAJOR_BRAND_TOKENS) and not is_used_car_superstore:
         return "franchise"
     if "auction" in name_lower:
         return "auction"
