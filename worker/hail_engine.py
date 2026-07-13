@@ -47,7 +47,6 @@ MRMS_S3_MESH_PREFIX = "CONUS/MESH_Max_60min_00.50/"
 SPRINGFIELD_LAT = 37.21
 SPRINGFIELD_LON = -93.29
 MM_PER_INCH = 25.4
-KML_DAMAGE_MIN_MM = 19.0
 MAJOR_BRAND_TOKENS = [
     "chevrolet",
     "chevy",
@@ -968,6 +967,12 @@ def create_hail_alert(
 
     triggered_at = alert.get("triggered_at") or alert_timestamp or (datetime.utcnow().replace(microsecond=0).isoformat() + "Z")
     region_name = region.get("name") or region.get("slug") or "Unknown Region"
+    dealer_only = not retail_triggered
+    primary_dealership_hits = [
+        hit
+        for hit in (dealership_hits or [])
+        if str(hit.get("tier") or "") in ("franchise", "auction")
+    ]
 
     canvass_targets: list[dict] = []
     if retail_triggered and kml_cells and region.get("id") is not None:
@@ -992,19 +997,37 @@ def create_hail_alert(
                 f"{float(row['hail_in']):>7.2f}  {row['profile_tag']}"
             )
 
+    if dealer_only and not primary_dealership_hits:
+        independent_only_count = len(
+            [hit for hit in (dealership_hits or []) if str(hit.get("tier") or "") == "independent"]
+        )
+        logger.info(
+            "Skipping email for dealer-only alert id=%s in region %s; no franchise/auction dealership hits (independent_hits=%s)",
+            alert.get("id"),
+            region.get("id"),
+            independent_only_count,
+        )
+        return alert
+
     kml_content = None
     kml_filename = None
     if kml_cells is not None:
-        event_date = triggered_at[:10]
-        kml_content = build_hail_swath_kml(
-            kml_cells,
-            region_name=region_name,
-            event_date=event_date,
-            canvass_targets=canvass_targets[:10],
-            dealership_hits=dealership_hits or [],
-        )
-        safe_region = re.sub(r"[^A-Za-z0-9_-]+", "-", region_name).strip("-") or "region"
-        kml_filename = f"damage-map-{safe_region}-{event_date}.kml"
+        if dealer_only and not (dealership_hits or []) and not kml_cells:
+            logger.warning(
+                "Dealer-only alert for region %s has zero swath cells and zero dealership hits; skipping empty map attachment",
+                region.get("id"),
+            )
+        else:
+            event_date = triggered_at[:10]
+            kml_content = build_hail_swath_kml(
+                kml_cells,
+                region_name=region_name,
+                event_date=event_date,
+                canvass_targets=canvass_targets[:10],
+                dealership_hits=dealership_hits or [],
+            )
+            safe_region = re.sub(r"[^A-Za-z0-9_-]+", "-", region_name).strip("-") or "region"
+            kml_filename = f"damage-map-{safe_region}-{event_date}.kml"
 
     sent = send_alert_email(
         region_name,
@@ -1014,7 +1037,7 @@ def create_hail_alert(
         kml_content=kml_content,
         top_canvass_targets=canvass_targets[:5],
         dealership_hits=dealership_hits or [],
-        dealer_only=not retail_triggered,
+        dealer_only=dealer_only,
     )
     if sent:
         try:
@@ -1069,6 +1092,7 @@ def process_regions(
     for region in regions:
         threshold_mm = float(region["threshold_mm"])
         dealer_threshold_mm = float(region.get("dealer_threshold_mm") or 12.7)
+        swath_floor_mm = min(threshold_mm, dealer_threshold_mm)
         hail_mm = read_mesh_max_in_bbox(
             mesh_path,
             float(region["min_lat"]),
@@ -1087,18 +1111,19 @@ def process_regions(
             if active_alert:
                 action = "active_alert"
                 if print_scores and region.get("id") is not None:
+                    swath_cells: list[tuple[float, float, float]] = []
                     try:
-                        kml_cells = read_mesh_cells_in_bbox_at_or_above(
+                        swath_cells = read_mesh_cells_in_bbox_at_or_above(
                             mesh_path,
                             float(region["min_lat"]),
                             float(region["min_lon"]),
                             float(region["max_lat"]),
                             float(region["max_lon"]),
-                            KML_DAMAGE_MIN_MM,
+                            swath_floor_mm,
                         )
                         if retail_triggered:
                             scored = score_canvass_targets(
-                                swath_cells=kml_cells,
+                                swath_cells=swath_cells,
                                 region_id=int(region["id"]),
                                 alert_timestamp=alert_timestamp,
                             )
@@ -1112,47 +1137,60 @@ def process_regions(
                     except Exception as exc:
                         logger.warning("Canvass score print failed for region %s: %s", region.get("id"), exc)
                     try:
-                        dealer_cells = read_mesh_cells_in_bbox_at_or_above(
-                            mesh_path,
-                            float(region["min_lat"]),
-                            float(region["min_lon"]),
-                            float(region["max_lat"]),
-                            float(region["max_lon"]),
-                            dealer_threshold_mm,
-                        )
                         dealerships = load_active_dealerships(int(region["id"]))
-                        dealership_hits = detect_dealership_hits(dealerships, dealer_cells, dealer_threshold_mm)
+                        dealership_hits = detect_dealership_hits(dealerships, swath_cells, dealer_threshold_mm)
                         print_dealership_hits(region.get("name") or region.get("slug") or "Region", dealership_hits)
                     except Exception as exc:
                         logger.warning("Dealership hit print failed for region %s: %s", region.get("id"), exc)
             elif region.get("id") is not None:
-                kml_cells = read_mesh_cells_in_bbox_at_or_above(
+                swath_cells = read_mesh_cells_in_bbox_at_or_above(
                     mesh_path,
                     float(region["min_lat"]),
                     float(region["min_lon"]),
                     float(region["max_lat"]),
                     float(region["max_lon"]),
-                    KML_DAMAGE_MIN_MM,
-                )
-                dealer_cells = read_mesh_cells_in_bbox_at_or_above(
-                    mesh_path,
-                    float(region["min_lat"]),
-                    float(region["min_lon"]),
-                    float(region["max_lat"]),
-                    float(region["max_lon"]),
-                    dealer_threshold_mm,
+                    swath_floor_mm,
                 )
 
                 dealership_hits: list[dict] = []
                 try:
                     dealerships = load_active_dealerships(int(region["id"]))
                     if dealerships:
-                        dealership_hits = detect_dealership_hits(dealerships, dealer_cells, dealer_threshold_mm)
+                        dealership_hits = detect_dealership_hits(dealerships, swath_cells, dealer_threshold_mm)
                     else:
                         logger.info("No dealerships loaded for region %s; skipping dealership hit detection", region.get("id"))
                 except Exception as exc:
                     logger.warning("Dealership hit detection failed for region %s; continuing alert flow: %s", region.get("id"), exc)
                     dealership_hits = []
+
+                primary_dealership_hits_count = len(
+                    [
+                        hit
+                        for hit in dealership_hits
+                        if str(hit.get("tier") or "") in ("franchise", "auction")
+                    ]
+                )
+                independent_dealership_hits_count = len(
+                    [hit for hit in dealership_hits if str(hit.get("tier") or "") == "independent"]
+                )
+                email_eligible = retail_triggered or primary_dealership_hits_count > 0
+                email_gate_reason = "retail-triggered"
+                if not retail_triggered:
+                    if primary_dealership_hits_count > 0:
+                        email_gate_reason = "dealer-primary-hit"
+                    else:
+                        email_gate_reason = "dealer-only-no-primary-hit"
+
+                logger.info(
+                    "Email gate region=%s eligible=%s reason=%s dealer_only=%s primary_hits=%s independent_hits=%s total_hits=%s",
+                    region.get("id"),
+                    email_eligible,
+                    email_gate_reason,
+                    (not retail_triggered),
+                    primary_dealership_hits_count,
+                    independent_dealership_hits_count,
+                    len(dealership_hits),
+                )
 
                 if not dry_run:
                     create_hail_alert(
@@ -1161,7 +1199,7 @@ def process_regions(
                         mesh_source,
                         hail_mm,
                         hail_in,
-                        kml_cells=kml_cells,
+                        kml_cells=swath_cells,
                         dealership_hits=dealership_hits,
                         alert_timestamp=alert_timestamp,
                         retail_triggered=retail_triggered,
@@ -1170,10 +1208,15 @@ def process_regions(
                     action = "created_alert"
                 else:
                     if print_scores and region.get("id") is not None:
+                        if dealer_triggered and not retail_triggered and not swath_cells and not dealership_hits:
+                            logger.warning(
+                                "Dealer-only alert candidate for region %s has zero swath cells and zero dealership hits; empty map would be skipped",
+                                region.get("id"),
+                            )
                         try:
                             if retail_triggered:
                                 scored = score_canvass_targets(
-                                    swath_cells=kml_cells,
+                                    swath_cells=swath_cells,
                                     region_id=int(region["id"]),
                                     alert_timestamp=alert_timestamp,
                                 )
@@ -1210,18 +1253,20 @@ def process_regions(
             "hail_in": hail_in,
             "threshold_mm": threshold_mm,
             "dealer_threshold_mm": dealer_threshold_mm,
+            "swath_floor_mm": swath_floor_mm,
             "retail_triggered": retail_triggered,
             "dealer_triggered": dealer_triggered,
             "triggered": triggered,
             "action": action,
         }
         logger.info(
-            "Region %s: hail=%.2f mm (%.2f in), retail_threshold=%.2f mm, dealer_threshold=%.2f mm, retail_triggered=%s, dealer_triggered=%s, action=%s",
+            "Region %s: hail=%.2f mm (%.2f in), retail_threshold=%.2f mm, dealer_threshold=%.2f mm, swath_floor=%.2f mm, retail_triggered=%s, dealer_triggered=%s, action=%s",
             summary["region"],
             hail_mm,
             hail_in,
             threshold_mm,
             dealer_threshold_mm,
+            swath_floor_mm,
             retail_triggered,
             dealer_triggered,
             action,
