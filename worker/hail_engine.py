@@ -605,12 +605,46 @@ def classify_dealership_tier(name: str, brand: str | None) -> str:
     return "independent"
 
 
+def _is_penske_group(value: str | None) -> bool:
+    return str(value or "").strip().lower() == "penske"
+
+
+def _is_penske_hit(hit: dict) -> bool:
+    return _is_penske_group(hit.get("dealer_group"))
+
+
+def _ordered_dealership_hits_for_display(dealership_hits: list[dict]) -> tuple[list[dict], int]:
+    # Show franchise/auction first-priority lots, plus any Penske lots regardless of tier.
+    display_hits: list[dict] = []
+    for hit in dealership_hits:
+        tier = str(hit.get("tier") or "").lower()
+        if tier in ("franchise", "auction") or _is_penske_hit(hit):
+            display_hits.append(hit)
+
+    display_hits.sort(
+        key=lambda hit: (
+            0 if _is_penske_hit(hit) else 1,
+            -float(hit.get("hail_mm") or 0.0),
+            str(hit.get("name") or "").lower(),
+        )
+    )
+
+    hidden_independent_count = len(
+        [
+            hit
+            for hit in dealership_hits
+            if str(hit.get("tier") or "").lower() == "independent" and not _is_penske_hit(hit)
+        ]
+    )
+    return display_hits, hidden_independent_count
+
+
 def load_active_dealerships(region_id: int) -> list[dict]:
     if not is_supabase_configured() or region_id is None:
         return []
 
     params = {
-        "select": "id,region_id,name,brand,tier,lat,lon,osm_id,active",
+        "select": "id,region_id,name,brand,dealer_group,tier,lat,lon,osm_id,active",
         "region_id": f"eq.{region_id}",
         "active": "eq.true",
     }
@@ -619,11 +653,28 @@ def load_active_dealerships(region_id: int) -> list[dict]:
         return response.json() or []
     except Exception as exc:
         message = str(exc)
-        if (
-            "Could not find the 'tier' column of 'dealerships'" not in message
-            and "column dealerships.tier does not exist" not in message
-        ):
+        missing_tier = (
+            "Could not find the 'tier' column of 'dealerships'" in message
+            or "column dealerships.tier does not exist" in message
+        )
+        missing_group = (
+            "Could not find the 'dealer_group' column of 'dealerships'" in message
+            or "column dealerships.dealer_group does not exist" in message
+        )
+        if not (missing_tier or missing_group):
             raise
+
+    if missing_group and not missing_tier:
+        fallback_no_group = {
+            "select": "id,region_id,name,brand,tier,lat,lon,osm_id,active",
+            "region_id": f"eq.{region_id}",
+            "active": "eq.true",
+        }
+        response = supabase_request("GET", SUPABASE_TABLE_DEALERSHIPS, params=fallback_no_group)
+        rows = response.json() or []
+        for row in rows:
+            row["dealer_group"] = None
+        return rows
 
     fallback_params = {
         "select": "id,region_id,name,brand,lat,lon,osm_id,active",
@@ -634,6 +685,7 @@ def load_active_dealerships(region_id: int) -> list[dict]:
     rows = response.json() or []
     for row in rows:
         row["tier"] = classify_dealership_tier(str(row.get("name") or ""), row.get("brand"))
+        row["dealer_group"] = None
     return rows
 
 
@@ -674,6 +726,7 @@ def detect_dealership_hits(
             {
                 "name": str(dealer.get("name") or "Dealership"),
                 "brand": dealer.get("brand"),
+                "dealer_group": dealer.get("dealer_group"),
                 "tier": str(dealer.get("tier") or "independent"),
                 "hail_mm": float(max_hail_mm),
                 "hail_in": mm_to_inches(float(max_hail_mm)),
@@ -693,17 +746,16 @@ def print_dealership_hits(region_name: str, hits: list[dict]) -> None:
         print("none")
         return
 
-    primary_hits = [h for h in hits if str(h.get("tier") or "") in ("franchise", "auction")]
-    independent_count = len([h for h in hits if str(h.get("tier") or "") == "independent"])
+    display_hits, hidden_independent_count = _ordered_dealership_hits_for_display(hits)
 
-    if primary_hits:
+    if display_hits:
         print("NAME  TIER  HAIL_IN")
-        for hit in primary_hits:
+        for hit in display_hits:
             print(f"{hit['name']}  {hit.get('tier')}  {float(hit['hail_in']):.2f}")
     else:
         print("none")
 
-    print(f"+ {independent_count} independent lots also in swath (see map)")
+    print(f"+ {hidden_independent_count} independent lots also in swath (see map)")
 
 
 def find_alert_by_region_and_mesh(region_id: int, mesh_url: str) -> dict | None:
@@ -795,9 +847,12 @@ def send_alert_email(
         return False
 
     endpoint = "https://api.resend.com/emails"
+    has_penske_hit = any(_is_penske_hit(hit) for hit in (dealership_hits or []))
     subject_prefix = "Hail Alert"
+    if has_penske_hit:
+        subject_prefix = f"[PENSKE] {subject_prefix}"
     if dealer_only:
-        subject_prefix = "Hail Alert [DEALER-ONLY]"
+        subject_prefix = f"{subject_prefix} [DEALER-ONLY]"
     subject = f"{subject_prefix}: {region_name} reached {hail_in:.2f}\""
     text = (
         "New hail alert triggered.\n"
@@ -829,18 +884,11 @@ def send_alert_email(
         html += "</ul>"
 
     if dealership_hits:
-        primary_hits = [
-            hit
-            for hit in dealership_hits
-            if str(hit.get("tier") or "") in ("franchise", "auction")
-        ]
-        independent_count = len(
-            [hit for hit in dealership_hits if str(hit.get("tier") or "") == "independent"]
-        )
+        display_hits, hidden_independent_count = _ordered_dealership_hits_for_display(dealership_hits)
 
         text += "\nDEALERSHIPS IN SWATH\n"
         html += "<h3>DEALERSHIPS IN SWATH</h3><ul>"
-        for hit in primary_hits:
+        for hit in display_hits:
             line = (
                 f"{hit.get('name')} | {str(hit.get('tier') or 'dealership')} | "
                 f"{float(hit.get('hail_in') or 0.0):.2f} in"
@@ -848,7 +896,7 @@ def send_alert_email(
             text += line + "\n"
             html += f"<li>{line}</li>"
         html += "</ul>"
-        footer = f"+ {independent_count} independent lots also in swath (see map)"
+        footer = f"+ {hidden_independent_count} independent lots also in swath (see map)"
         text += footer + "\n"
         html += f"<p>{footer}</p>"
 
@@ -973,6 +1021,7 @@ def create_hail_alert(
         for hit in (dealership_hits or [])
         if str(hit.get("tier") or "") in ("franchise", "auction")
     ]
+    penske_hits = [hit for hit in (dealership_hits or []) if _is_penske_hit(hit)]
 
     canvass_targets: list[dict] = []
     if retail_triggered and kml_cells and region.get("id") is not None:
@@ -997,12 +1046,12 @@ def create_hail_alert(
                 f"{float(row['hail_in']):>7.2f}  {row['profile_tag']}"
             )
 
-    if dealer_only and not primary_dealership_hits:
+    if dealer_only and not primary_dealership_hits and not penske_hits:
         independent_only_count = len(
             [hit for hit in (dealership_hits or []) if str(hit.get("tier") or "") == "independent"]
         )
         logger.info(
-            "Skipping email for dealer-only alert id=%s in region %s; no franchise/auction dealership hits (independent_hits=%s)",
+            "Skipping email for dealer-only alert id=%s in region %s; no franchise/auction or Penske dealership hits (independent_hits=%s)",
             alert.get("id"),
             region.get("id"),
             independent_only_count,
@@ -1170,24 +1219,28 @@ def process_regions(
                         if str(hit.get("tier") or "") in ("franchise", "auction")
                     ]
                 )
+                penske_hits_count = len([hit for hit in dealership_hits if _is_penske_hit(hit)])
                 independent_dealership_hits_count = len(
                     [hit for hit in dealership_hits if str(hit.get("tier") or "") == "independent"]
                 )
-                email_eligible = retail_triggered or primary_dealership_hits_count > 0
+                email_eligible = retail_triggered or primary_dealership_hits_count > 0 or penske_hits_count > 0
                 email_gate_reason = "retail-triggered"
                 if not retail_triggered:
                     if primary_dealership_hits_count > 0:
                         email_gate_reason = "dealer-primary-hit"
+                    elif penske_hits_count > 0:
+                        email_gate_reason = "dealer-penske-hit"
                     else:
-                        email_gate_reason = "dealer-only-no-primary-hit"
+                        email_gate_reason = "dealer-only-no-primary-or-penske-hit"
 
                 logger.info(
-                    "Email gate region=%s eligible=%s reason=%s dealer_only=%s primary_hits=%s independent_hits=%s total_hits=%s",
+                    "Email gate region=%s eligible=%s reason=%s dealer_only=%s primary_hits=%s penske_hits=%s independent_hits=%s total_hits=%s",
                     region.get("id"),
                     email_eligible,
                     email_gate_reason,
                     (not retail_triggered),
                     primary_dealership_hits_count,
+                    penske_hits_count,
                     independent_dealership_hits_count,
                     len(dealership_hits),
                 )
