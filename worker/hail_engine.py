@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -14,6 +15,7 @@ from urllib.parse import urljoin, urlparse
 import numpy as np
 import pygrib
 import requests
+from requests.exceptions import ChunkedEncodingError, ConnectionError as RequestsConnectionError, Timeout
 from dotenv import load_dotenv
 
 try:
@@ -277,14 +279,60 @@ def download_mesh(source: str, dest: Path) -> Path:
         source = resolve_latest_mesh_url_from_sources()
 
     if source.startswith(("http://", "https://")):
-        logger.info("Downloading %s -> %s", source, dest)
-        response = requests.get(source, stream=True, timeout=60)
-        response.raise_for_status()
-        with dest.open("wb") as file:
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    file.write(chunk)
-        return dest
+        retry_delays = [2, 5]
+        max_attempts = 3
+        last_error = None
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                logger.info("Downloading %s -> %s (attempt %s/%s)", source, dest, attempt, max_attempts)
+                if dest.exists():
+                    dest.unlink()
+
+                response = requests.get(source, stream=True, timeout=60)
+                response.raise_for_status()
+                with dest.open("wb") as file:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if chunk:
+                            file.write(chunk)
+
+                if not dest.exists() or dest.stat().st_size == 0:
+                    raise RuntimeError(f"Downloaded file is empty: {dest}")
+
+                if dest.suffix == ".gz":
+                    try:
+                        with gzip.open(dest, "rb") as gz_file:
+                            while gz_file.read(1024 * 1024):
+                                pass
+                    except Exception as exc:
+                        raise RuntimeError(f"Downloaded gzip validation failed for {dest}: {exc}") from exc
+
+                return dest
+            except (ChunkedEncodingError, RequestsConnectionError, Timeout, RuntimeError) as exc:
+                last_error = exc
+                if dest.exists():
+                    try:
+                        dest.unlink()
+                    except Exception:
+                        logger.debug("Failed to remove partial download %s", dest)
+
+                if attempt < max_attempts:
+                    delay = retry_delays[attempt - 1]
+                    logger.warning(
+                        "Transient download failure for %s on attempt %s/%s: %s. Retrying in %ss...",
+                        source,
+                        attempt,
+                        max_attempts,
+                        exc,
+                        delay,
+                    )
+                    time.sleep(delay)
+                    continue
+                break
+
+        raise RuntimeError(
+            f"Failed to download and validate MESH file after {max_attempts} attempts from {source}: {last_error}"
+        ) from last_error
 
     local_path = Path(source)
     if local_path.exists():
@@ -1394,18 +1442,26 @@ def main() -> int:
 
     source = args.source
     resolved_source = None
-    if source.lower() == "latest":
-        mesh_url = resolve_latest_mesh_url_from_sources()
-        dest_path = Path(urlparse(mesh_url).path).name
-        mesh_path = download_mesh(mesh_url, Path(dest_path))
-        resolved_source = mesh_url
-    elif source.startswith(("http://", "https://")):
-        dest_path = Path(urlparse(source).path).name
-        mesh_path = download_mesh(source, Path(dest_path))
-        resolved_source = source
-    else:
-        mesh_path = download_mesh(source, Path(source))
-        resolved_source = str(mesh_path)
+    try:
+        if source.lower() == "latest":
+            mesh_url = resolve_latest_mesh_url_from_sources()
+            dest_path = Path(urlparse(mesh_url).path).name
+            mesh_path = download_mesh(mesh_url, Path(dest_path))
+            resolved_source = mesh_url
+        elif source.startswith(("http://", "https://")):
+            dest_path = Path(urlparse(source).path).name
+            mesh_path = download_mesh(source, Path(dest_path))
+            resolved_source = source
+        else:
+            mesh_path = download_mesh(source, Path(source))
+            resolved_source = str(mesh_path)
+    except Exception as exc:
+        logger.error(
+            "MESH download cycle skipped: unable to resolve/download/validate source '%s': %s",
+            source,
+            exc,
+        )
+        return 0
 
     print("--- HAIL LEAD ENGINE PHASE 1 ---")
     print(f"Requested source: {source}")
