@@ -880,6 +880,50 @@ def has_recent_alert_for_region(region_id: int, within_hours: int, exclude_alert
             return False
 
 
+def send_plain_status_email(subject: str, text: str, html: str | None = None) -> bool:
+    if not is_email_configured():
+        logger.info("Email alert not configured; skipping send")
+        return False
+
+    endpoint = "https://api.resend.com/emails"
+    payload = {
+        "from": RESEND_FROM_EMAIL,
+        "to": [ALERT_EMAIL_TO],
+        "subject": subject,
+        "text": text,
+    }
+    if html:
+        payload["html"] = html
+
+    headers = {
+        "Authorization": f"Bearer {RESEND_API_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+    try:
+        response = requests.post(endpoint, headers=headers, json=payload, timeout=30)
+        if response.status_code >= 400:
+            logger.warning("Resend email failed: %s %s", response.status_code, response.text)
+            return False
+
+        message_id = None
+        try:
+            response_payload = response.json()
+            message_id = response_payload.get("id")
+        except Exception:
+            message_id = None
+
+        if message_id:
+            logger.info("Resend email sent to %s (message_id=%s)", ALERT_EMAIL_TO, message_id)
+        else:
+            logger.info("Resend email sent to %s (message_id unavailable)", ALERT_EMAIL_TO)
+        return True
+    except Exception as exc:
+        logger.warning("Resend email request failed: %s", exc)
+        return False
+
+
 def send_alert_email(
     region_name: str,
     hail_in: float,
