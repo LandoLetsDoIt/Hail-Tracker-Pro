@@ -29,9 +29,9 @@ def in_window(now: datetime | None = None) -> bool:
         return True
     if now is None:
         now = datetime.now(CHICAGO_TZ)
-    if now.hour == 21 and 45 <= now.minute <= 59:
+    if now.hour == 21 and now.minute >= 30:
         return True
-    if now.hour == 22 and 0 <= now.minute <= 15:
+    if now.hour == 22 and now.minute <= 45:
         return True
     return False
 
@@ -61,6 +61,30 @@ def fetch_recent_alerts() -> list[dict]:
     )
     response.raise_for_status()
     return response.json()
+
+
+def already_sent_today(send_date) -> bool:
+    response = requests.get(
+        f"{SUPABASE_URL}/rest/v1/heartbeat_log",
+        headers=get_supabase_headers(),
+        params={"select": "sent_date", "sent_date": f"eq.{send_date.isoformat()}"},
+        timeout=30,
+    )
+    response.raise_for_status()
+    return len(response.json()) > 0
+
+
+def mark_sent_today(send_date) -> None:
+    headers = get_supabase_headers()
+    headers["Content-Type"] = "application/json"
+    headers["Prefer"] = "resolution=ignore-duplicates"
+    response = requests.post(
+        f"{SUPABASE_URL}/rest/v1/heartbeat_log",
+        headers=headers,
+        json={"sent_date": send_date.isoformat()},
+        timeout=30,
+    )
+    response.raise_for_status()
 
 
 def fetch_regions() -> list[dict]:
@@ -182,13 +206,20 @@ def send_status_email(summary: dict) -> bool:
 def main() -> int:
     now = datetime.now(CHICAGO_TZ)
     if not in_window(now):
+        logger.info("Outside heartbeat window (Central time=%s); skipping", now.isoformat())
         return 0
 
     try:
+        if not HEARTBEAT_DRY_RUN and already_sent_today(now.date()):
+            logger.info("Heartbeat already sent for %s; skipping duplicate", now.date().isoformat())
+            return 0
+
         alerts = fetch_recent_alerts()
         regions = fetch_regions()
         summary = summarize_alerts(alerts, regions)
-        send_status_email(summary)
+        sent = send_status_email(summary)
+        if sent and not HEARTBEAT_DRY_RUN:
+            mark_sent_today(now.date())
     except Exception as exc:
         if HEARTBEAT_DRY_RUN:
             logger.warning("Heartbeat dry run using empty summary after error: %s", exc)
