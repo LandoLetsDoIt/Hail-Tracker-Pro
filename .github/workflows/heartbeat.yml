@@ -1,13 +1,19 @@
 name: Heartbeat
 
 on:
-  schedule:
-    # Runs every 15 min across 02:00-04:59 UTC, which covers the
-    # 21:30-22:45 Central send window under both CDT (UTC-5) and
-    # CST (UTC-6). heartbeat.py's in_window() guard + heartbeat_log
-    # dedup ensure only one email actually goes out per night.
-    - cron: '*/15 2-4 * * *'
+  # GitHub's native `schedule` trigger is unreliable for this: it
+  # silently dropped ~10 of 12 expected */15 firings overnight and
+  # the 2 that did fire landed at arbitrary times outside the send
+  # window. An external cron service now hits this via the Actions
+  # API (POST .../actions/workflows/heartbeat.yml/dispatches) at a
+  # precise, timezone-aware 10pm Central daily. See README for setup.
   workflow_dispatch:
+    inputs:
+      bypass_window:
+        description: 'Bypass the time-window guard (manual testing only)'
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   heartbeat:
@@ -17,6 +23,7 @@ jobs:
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
       RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
       ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
+      HEARTBEAT_BYPASS_WINDOW: ${{ (inputs.bypass_window && '1') || '0' }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4

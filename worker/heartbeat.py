@@ -25,13 +25,17 @@ HEARTBEAT_DRY_RUN = os.getenv("HEARTBEAT_DRY_RUN", "0") == "1"
 
 
 def in_window(now: datetime | None = None) -> bool:
+    """Sanity check only. Timing precision is owned by the external
+    cron service that fires workflow_dispatch at 22:00 Central; this
+    just guards against a stray/manual dispatch far outside that time.
+    """
     if HEARTBEAT_BYPASS_WINDOW:
         return True
     if now is None:
         now = datetime.now(CHICAGO_TZ)
-    if now.hour == 21 and now.minute >= 30:
+    if now.hour == 21 and now.minute >= 45:
         return True
-    if now.hour == 22 and now.minute <= 45:
+    if now.hour == 22 and now.minute <= 15:
         return True
     return False
 
