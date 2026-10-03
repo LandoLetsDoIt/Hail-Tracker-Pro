@@ -5,6 +5,10 @@ on:
     - cron: '*/10 * * * *'
   workflow_dispatch:
 
+permissions:
+  contents: read
+  actions: write
+
 jobs:
   run-hail-engine:
     runs-on: ubuntu-latest
@@ -35,3 +39,9 @@ jobs:
       - name: Run hail engine
         run: |
           python worker/hail_engine.py latest --scan-regions
+
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: gautamkrishnar/keepalive-workflow@v2
