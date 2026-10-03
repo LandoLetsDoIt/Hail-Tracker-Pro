@@ -1,13 +1,10 @@
 name: Hail Engine Phase 1
 
 on:
-  schedule:
-    - cron: '*/10 * * * *'
   workflow_dispatch:
 
 permissions:
   contents: read
-  actions: write
 
 jobs:
   run-hail-engine:
@@ -39,10 +36,3 @@ jobs:
       - name: Run hail engine
         run: |
           python worker/hail_engine.py latest --scan-regions
-  keepalive:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Re-enable workflow to reset inactivity timer
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh api -X PUT repos/${{ github.repository }}/actions/workflows/hail_engine.yml/enable
