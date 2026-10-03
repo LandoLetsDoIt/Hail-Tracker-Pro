@@ -39,9 +39,10 @@ jobs:
       - name: Run hail engine
         run: |
           python worker/hail_engine.py latest --scan-regions
-
   keepalive:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: gautamkrishnar/keepalive-workflow@v2
+      - name: Re-enable workflow to reset inactivity timer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT repos/${{ github.repository }}/actions/workflows/hail_engine.yml/enable
