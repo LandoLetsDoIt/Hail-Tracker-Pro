@@ -1,7 +1,15 @@
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from worker.heartbeat import build_status_body, in_window, summarize_alerts
+
+EMPTY_SUMMARY = {
+    "retail_count": 0,
+    "dealer_sent_count": 0,
+    "dealer_suppressed_count": 0,
+    "active_region_count": 0,
+    "highest": None,
+}
 
 
 def test_in_window_accepts_chicago_window():
@@ -38,3 +46,32 @@ def test_build_status_body_handles_no_activity():
 
     assert "[NO ACTIVITY]" in body
     assert "Alerts created: 0" in body
+
+
+def test_build_status_body_flags_engine_down_when_never_ran():
+    body = build_status_body({**EMPTY_SUMMARY, "engine_last_run": None}, 18)
+
+    assert "[ENGINE DOWN]" in body
+    assert "never" in body
+
+
+def test_build_status_body_flags_engine_down_when_stale():
+    stale = datetime.now(timezone.utc) - timedelta(hours=3)
+    body = build_status_body({**EMPTY_SUMMARY, "engine_last_run": stale}, 18)
+
+    assert "[ENGINE DOWN]" in body
+    assert "3.0 hours ago" in body
+
+
+def test_build_status_body_passes_through_when_engine_fresh():
+    fresh = datetime.now(timezone.utc) - timedelta(minutes=10)
+    body = build_status_body({**EMPTY_SUMMARY, "engine_last_run": fresh}, 18)
+
+    assert "[NO ACTIVITY]" in body
+
+
+def test_build_status_body_reports_engine_check_failure():
+    body = build_status_body({**EMPTY_SUMMARY, "engine_check_error": "GITHUB_TOKEN and GITHUB_REPOSITORY must be set"}, 18)
+
+    assert "[ENGINE CHECK FAILED]" in body
+    assert "GITHUB_TOKEN and GITHUB_REPOSITORY must be set" in body

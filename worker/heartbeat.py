@@ -18,6 +18,9 @@ SUPABASE_URL = (os.getenv("SUPABASE_URL") or os.getenv("NEXT_PUBLIC_SUPABASE_URL
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 ALERT_EMAIL_TO = os.getenv("ALERT_EMAIL_TO")
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+GITHUB_REPOSITORY = os.getenv("GITHUB_REPOSITORY")
+ENGINE_STALE_AFTER = timedelta(hours=2)
 RESEND_FROM_EMAIL = "onboarding@resend.dev"
 MONITORED_REGIONS_COUNT = 18
 HEARTBEAT_BYPASS_WINDOW = os.getenv("HEARTBEAT_BYPASS_WINDOW", "0") == "1"
@@ -105,6 +108,26 @@ def fetch_regions() -> list[dict]:
     return response.json()
 
 
+def fetch_last_engine_run() -> datetime | None:
+    if not GITHUB_TOKEN or not GITHUB_REPOSITORY:
+        raise RuntimeError("GITHUB_TOKEN and GITHUB_REPOSITORY must be set")
+    response = requests.get(
+        f"https://api.github.com/repos/{GITHUB_REPOSITORY}/actions/workflows/hail_engine.yml/runs",
+        headers={
+            "Authorization": f"Bearer {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+        params={"status": "success", "per_page": 1},
+        timeout=30,
+    )
+    response.raise_for_status()
+    runs = response.json().get("workflow_runs", [])
+    if not runs:
+        return None
+    return datetime.fromisoformat(runs[0]["updated_at"].replace("Z", "+00:00"))
+
+
 def summarize_alerts(alerts: list[dict], regions: list[dict]) -> dict:
     region_map = {int(region["id"]): region["name"] for region in regions}
     retail_count = 0
@@ -148,6 +171,31 @@ def summarize_alerts(alerts: list[dict], regions: list[dict]) -> dict:
 
 
 def build_status_body(summary: dict, monitored_regions_count: int = MONITORED_REGIONS_COUNT) -> str:
+    if "engine_check_error" in summary:
+        subject = "Hail Tracker — Nightly Status [ENGINE CHECK FAILED]"
+        body_lines = [
+            "Could not verify whether the hail engine ran. Status below is unverified.",
+            f"Error: {summary['engine_check_error']}",
+            "Check the Hail Engine Phase 1 workflow runs in GitHub Actions and the Supabase net._http_response log.",
+        ]
+        return "\n".join([subject, *body_lines])
+
+    if "engine_last_run" in summary:
+        last_run = summary["engine_last_run"]
+        if last_run is None or datetime.now(timezone.utc) - last_run > ENGINE_STALE_AFTER:
+            if last_run is None:
+                last_run_text = "never"
+            else:
+                hours_ago = (datetime.now(timezone.utc) - last_run).total_seconds() / 3600
+                last_run_text = f"{hours_ago:.1f} hours ago"
+            subject = "Hail Tracker — Nightly Status [ENGINE DOWN]"
+            body_lines = [
+                "WARNING: the hail engine has not completed a successful run recently.",
+                f"Last successful engine run: {last_run_text}",
+                "Check the Hail Engine Phase 1 workflow runs in GitHub Actions and the Supabase net._http_response log.",
+            ]
+            return "\n".join([subject, *body_lines])
+
     total_alerts = (
         summary["retail_count"]
         + summary["dealer_sent_count"]
@@ -221,6 +269,11 @@ def main() -> int:
         alerts = fetch_recent_alerts()
         regions = fetch_regions()
         summary = summarize_alerts(alerts, regions)
+        try:
+            summary["engine_last_run"] = fetch_last_engine_run()
+        except Exception as exc:
+            logger.warning("Engine liveness check failed: %s", exc)
+            summary["engine_check_error"] = str(exc)
         sent = send_status_email(summary)
         if sent and not HEARTBEAT_DRY_RUN:
             mark_sent_today(now.date())

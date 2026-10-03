@@ -15,14 +15,19 @@ on:
         default: false
         type: boolean
 
+permissions:
+  contents: read
+  actions: read
+
 jobs:
   heartbeat:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
       RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
       ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
+      GITHUB_TOKEN: ${{ github.token }}
       HEARTBEAT_BYPASS_WINDOW: ${{ (inputs.bypass_window && '1') || '0' }}
     steps:
       - name: Checkout repository
