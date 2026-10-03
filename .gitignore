@@ -51,3 +51,6 @@ __pycache__/
 *.grib2.gz
 miniconda.exe
 worker/test_outputs/
+# credential/token files
+*token*.txt
+*token*.json
