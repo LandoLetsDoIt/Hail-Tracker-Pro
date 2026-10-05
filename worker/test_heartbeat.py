@@ -1,7 +1,8 @@
 from datetime import datetime, timedelta, timezone
+from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
 
-from worker.heartbeat import build_status_body, in_window, summarize_alerts
+from worker.heartbeat import build_status_body, fetch_last_engine_run, in_window, summarize_alerts
 
 EMPTY_SUMMARY = {
     "retail_count": 0,
@@ -68,6 +69,36 @@ def test_build_status_body_passes_through_when_engine_fresh():
     body = build_status_body({**EMPTY_SUMMARY, "engine_last_run": fresh}, 18)
 
     assert "[NO ACTIVITY]" in body
+
+
+def _mock_runs_response(runs):
+    response = MagicMock()
+    response.json.return_value = {"workflow_runs": runs}
+    return response
+
+
+@patch("worker.heartbeat.GITHUB_REPOSITORY", "owner/repo")
+@patch("worker.heartbeat.GITHUB_TOKEN", "token")
+def test_fetch_last_engine_run_skips_newer_non_success_runs():
+    runs = [
+        {"conclusion": "failure", "updated_at": "2026-10-05T20:45:05Z"},
+        {"conclusion": None, "updated_at": "2026-10-05T21:00:02Z"},
+        {"conclusion": "success", "updated_at": "2026-10-05T20:42:03Z"},
+        {"conclusion": "success", "updated_at": "2026-10-05T20:11:57Z"},
+    ]
+    with patch("worker.heartbeat.requests.get", return_value=_mock_runs_response(runs)) as get:
+        result = fetch_last_engine_run()
+
+    assert result == datetime(2026, 10, 5, 20, 42, 3, tzinfo=timezone.utc)
+    assert "status" not in get.call_args.kwargs["params"]
+
+
+@patch("worker.heartbeat.GITHUB_REPOSITORY", "owner/repo")
+@patch("worker.heartbeat.GITHUB_TOKEN", "token")
+def test_fetch_last_engine_run_returns_none_when_no_success_in_page():
+    runs = [{"conclusion": "failure", "updated_at": "2026-10-05T20:45:05Z"}]
+    with patch("worker.heartbeat.requests.get", return_value=_mock_runs_response(runs)):
+        assert fetch_last_engine_run() is None
 
 
 def test_build_status_body_reports_engine_check_failure():

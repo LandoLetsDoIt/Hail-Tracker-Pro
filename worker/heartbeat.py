@@ -118,14 +118,15 @@ def fetch_last_engine_run() -> datetime | None:
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
         },
-        params={"status": "success", "per_page": 1},
+        params={"per_page": 50},
         timeout=30,
     )
     response.raise_for_status()
-    runs = response.json().get("workflow_runs", [])
-    if not runs:
-        return None
-    return datetime.fromisoformat(runs[0]["updated_at"].replace("Z", "+00:00"))
+    # Filter on conclusion here (newest first) rather than via the status query param.
+    for run in response.json().get("workflow_runs", []):
+        if run.get("conclusion") == "success":
+            return datetime.fromisoformat(run["updated_at"].replace("Z", "+00:00"))
+    return None
 
 
 def summarize_alerts(alerts: list[dict], regions: list[dict]) -> dict:
